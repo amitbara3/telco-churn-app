@@ -54,6 +54,7 @@ model/
   churn_model.joblib   Trained scikit-learn Pipeline (feature eng. + preprocessing + model)
   decision_threshold.json  Tuned churn/no-churn probability cutoff
   metrics.json          Evaluation metrics for all candidate models
+  feature_importance.json  Full ranked feature importances of the deployed model
   feature_schema.json    Allowed categories / numeric ranges, used by the UI
 tests/
   test_api.py          API tests (pytest + FastAPI TestClient)
@@ -116,6 +117,44 @@ model's best hyperparameters and CV scores):
 | **LightGBM (selected)** | **0.851** | **0.32** | **0.761** | **0.632** | **0.840** |
 | Ensemble (top 3) | — | 0.42 | 0.771 | 0.625 | 0.840 |
 | Ensemble (all 5) | — | 0.43 | 0.770 | 0.630 | 0.840 |
+
+### Feature importance
+
+Full ranked list for the deployed model (LightGBM) is written to
+`model/feature_importance.json` on every training run — normalized so
+values sum to 1 across all 47 encoded columns. Top 5:
+
+| Feature | Importance |
+|---|---|
+| `tenure` | 14.2% |
+| `MonthlyCharges` | 12.1% |
+| `charges_delta` | 10.5% |
+| `TotalCharges` | 9.9% |
+| `avg_charge_per_tenure` | 8.9% |
+
+...and the tail — the 10 least useful of the 47 encoded columns:
+
+| Feature | Importance |
+|---|---|
+| `tenure_bucket_24-48` | 0.29% |
+| `PaymentMethod_Credit card (automatic)` | 0.29% |
+| `tenure_bucket_0-12` | 0.29% |
+| `PaymentMethod_Mailed check` | 0.29% |
+| `tenure_bucket_48-60` | 0.29% |
+| `StreamingTV_Yes` | 0.22% |
+| `tenure_bucket_60+` | 0.15% |
+| `OnlineBackup_Yes` | 0.15% |
+| `Partner_Yes` | 0.07% |
+| `DeviceProtection_Yes` | 0.0% (literally unused) |
+
+18 of the 47 encoded columns carry <0.5% of total importance each — a
+combined 5.0%. That's *after* already removing the worst structural
+redundancy (the collapsed `"No internet/phone service"` duplicates); what's
+left in this tail is mostly individual one-hot categories from
+low-signal columns (`Partner`, `DeviceProtection`, `PaymentMethod`) rather
+than anything mechanically redundant, so there isn't another free cleanup
+pass here — it's just genuinely weak signal in those columns for this
+target.
 
 ### What moved the numbers, and what didn't
 

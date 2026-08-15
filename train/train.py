@@ -55,6 +55,7 @@ MODEL_PATH = MODEL_DIR / "churn_model.joblib"
 METRICS_PATH = MODEL_DIR / "metrics.json"
 SCHEMA_PATH = MODEL_DIR / "feature_schema.json"
 THRESHOLD_PATH = MODEL_DIR / "decision_threshold.json"
+IMPORTANCE_PATH = MODEL_DIR / "feature_importance.json"
 
 CATEGORICAL_FEATURES = [
     "gender",
@@ -207,6 +208,39 @@ def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
     return best_t, best_f1
 
 
+def extract_feature_importance(pipeline) -> pd.Series | None:
+    """Feature importances (normalized to sum to 1) for the final model,
+    mapped back to real column names via the preprocessor. Handles a plain
+    Pipeline (tree models' feature_importances_, or |coef_| for linear
+    models) and an AverageProbabilityEnsemble (averages its members')."""
+
+    def single(p: Pipeline) -> pd.Series | None:
+        model = p.named_steps["model"]
+        names = p.named_steps["preprocess"].get_feature_names_out()
+        if hasattr(model, "feature_importances_"):
+            values = np.asarray(model.feature_importances_, dtype=float)
+        elif hasattr(model, "coef_"):
+            values = np.abs(np.asarray(model.coef_[0], dtype=float))
+        else:
+            return None
+        if values.sum() > 0:
+            values = values / values.sum()
+        return pd.Series(values, index=names)
+
+    if isinstance(pipeline, AverageProbabilityEnsemble):
+        members = [single(p) for p in pipeline.fitted_pipelines]
+        members = [m for m in members if m is not None]
+        if not members:
+            return None
+        combined = pd.concat(members, axis=1).mean(axis=1)
+    else:
+        combined = single(pipeline)
+        if combined is None:
+            return None
+
+    return combined.sort_values(ascending=False)
+
+
 def evaluate_at_threshold(y_true, y_proba, threshold: float) -> dict:
     preds = (y_proba >= threshold).astype(int)
     return {
@@ -331,6 +365,27 @@ def main() -> None:
     METRICS_PATH.write_text(
         json.dumps({"selected_model": best_name, "candidates": results}, indent=2)
     )
+
+    importance = extract_feature_importance(best_pipeline)
+    if importance is not None:
+        IMPORTANCE_PATH.write_text(
+            json.dumps(
+                [
+                    {"feature": feat, "importance": round(float(val), 6)}
+                    for feat, val in importance.items()
+                ],
+                indent=2,
+            )
+        )
+        tail_n = min(10, len(importance))
+        dead_weight = importance[importance < 0.005]  # <0.5% of total importance each
+        print(f"\nTop 5 features: {list(importance.head(5).items())}")
+        print(f"Bottom {tail_n} features: {list(importance.tail(tail_n).items())}")
+        print(
+            f"Dead-weight features (<0.5% each): {len(dead_weight)} of {len(importance)}, "
+            f"combined {dead_weight.sum():.1%} of total importance"
+        )
+        print(f"Saved feature importance to {IMPORTANCE_PATH}")
 
     # Feature schema used to build the API's Pydantic model and the
     # Streamlit form: allowed categories per categorical column, and
