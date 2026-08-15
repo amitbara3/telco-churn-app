@@ -42,7 +42,12 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # so `python train/train.py` can `import app.*`
 
-from app.features import ENGINEERED_CATEGORICAL, ENGINEERED_NUMERIC, FeatureEngineer  # noqa: E402
+from app.features import (  # noqa: E402
+    ENGINEERED_CATEGORICAL,
+    ENGINEERED_NUMERIC,
+    AverageProbabilityEnsemble,
+    FeatureEngineer,
+)
 
 DATA_PATH = ROOT / "data" / "Telco-Customer-Churn.csv"
 MODEL_DIR = ROOT / "model"
@@ -130,6 +135,7 @@ def search_spaces() -> dict:
                 "model__n_estimators": [200, 300, 400],
                 "model__max_depth": [4, 6, 8, 10, None],
                 "model__min_samples_leaf": [1, 2, 4, 8],
+                "model__min_samples_split": [2, 5, 10, 20],
                 "model__max_features": ["sqrt", "log2"],
             },
         ),
@@ -140,6 +146,7 @@ def search_spaces() -> dict:
                 "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
                 "model__max_depth": [2, 3, 4],
                 "model__subsample": [0.7, 0.85, 1.0],
+                "model__min_samples_leaf": [1, 5, 10, 20],
             },
         ),
         "xgboost": (
@@ -155,6 +162,11 @@ def search_spaces() -> dict:
                 "model__subsample": [0.6, 0.8, 1.0],
                 "model__colsample_bytree": [0.6, 0.8, 1.0],
                 "model__min_child_weight": [1, 3, 5],
+                # L1/L2 regularization + min split-loss gain, to close the
+                # ~0.03 train/test ROC-AUC gap seen on the untuned range.
+                "model__reg_alpha": np.logspace(-3, 1, 10),
+                "model__reg_lambda": np.logspace(-3, 1, 10),
+                "model__gamma": [0, 0.1, 0.5, 1, 2],
             },
         ),
         "lightgbm": (
@@ -172,9 +184,17 @@ def search_spaces() -> dict:
                 "model__subsample": [0.6, 0.8, 1.0],
                 "model__colsample_bytree": [0.6, 0.8, 1.0],
                 "model__min_child_samples": [5, 10, 20, 30],
+                "model__reg_alpha": np.logspace(-3, 1, 10),
+                "model__reg_lambda": np.logspace(-3, 1, 10),
             },
         ),
     }
+
+
+ENSEMBLE_COMBOS = {
+    "ensemble_top3": 3,
+    "ensemble_all5": 5,
+}
 
 
 def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
@@ -213,7 +233,8 @@ def main() -> None:
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
     results = {}
-    best_name, best_pipeline, best_threshold, best_test_f1 = None, None, 0.5, -1.0
+    fitted = {}  # name -> {pipeline, oof_proba, test_proba, cv_roc_auc_mean}
+    candidate_pipelines = {}  # name -> object with .predict_proba(X), for saving
 
     for name, (estimator, param_dist) in search_spaces().items():
         pipeline = build_pipeline(estimator)
@@ -251,6 +272,12 @@ def main() -> None:
             "oof_train_f1_at_threshold": oof_f1,
             "test_metrics": test_metrics,
         }
+        fitted[name] = {
+            "oof_proba": oof_proba,
+            "test_proba": test_proba,
+            "cv_roc_auc_mean": float(search.best_score_),
+        }
+        candidate_pipelines[name] = tuned_pipeline
 
         print(
             f"{name}: cv_roc_auc={search.best_score_:.3f} (+/-{cv_std:.3f})  "
@@ -259,13 +286,40 @@ def main() -> None:
             f"test_acc={test_metrics['accuracy']:.3f}"
         )
 
-        if test_metrics["f1"] > best_test_f1:
-            best_name, best_pipeline, best_threshold, best_test_f1 = (
-                name,
-                tuned_pipeline,
-                threshold,
-                test_metrics["f1"],
-            )
+    # Probability-average ensembles of the top-K individual models by CV
+    # ROC-AUC. A simple average blend often generalizes slightly better
+    # than any single model once individual candidates have converged to
+    # similar performance, by cancelling out some of each model's
+    # uncorrelated errors.
+    ranked = sorted(fitted, key=lambda n: fitted[n]["cv_roc_auc_mean"], reverse=True)
+    for ensemble_name, k in ENSEMBLE_COMBOS.items():
+        members = ranked[:k]
+        oof_avg = np.mean([fitted[m]["oof_proba"] for m in members], axis=0)
+        threshold, oof_f1 = best_threshold_for_f1(y_train, oof_avg)
+        test_avg = np.mean([fitted[m]["test_proba"] for m in members], axis=0)
+        test_metrics = evaluate_at_threshold(y_test, test_avg, threshold)
+
+        results[ensemble_name] = {
+            "members": members,
+            "tuned_decision_threshold": threshold,
+            "oof_train_f1_at_threshold": oof_f1,
+            "test_metrics": test_metrics,
+        }
+        candidate_pipelines[ensemble_name] = AverageProbabilityEnsemble(
+            [candidate_pipelines[m] for m in members]
+        )
+
+        print(
+            f"{ensemble_name} ({'+'.join(members)}): "
+            f"threshold={threshold:.2f}  "
+            f"test_f1={test_metrics['f1']:.3f}  test_roc_auc={test_metrics['roc_auc']:.3f}  "
+            f"test_acc={test_metrics['accuracy']:.3f}"
+        )
+
+    best_name = max(results, key=lambda n: results[n]["test_metrics"]["f1"])
+    best_pipeline = candidate_pipelines[best_name]
+    best_threshold = results[best_name]["tuned_decision_threshold"]
+    best_test_f1 = results[best_name]["test_metrics"]["f1"]
 
     print(
         f"\nSelected best model: {best_name} "

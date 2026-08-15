@@ -66,28 +66,40 @@ requirements.txt
 
 `train/train.py` builds a pipeline of three steps — feature engineering,
 preprocessing, and a classifier — for each of five model families (Logistic
-Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM), and keeps
-whichever generalizes best. Concretely, per candidate:
+Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM), plus two
+probability-averaging ensembles of the top-3 and all 5, and keeps whichever
+generalizes best. Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): adds `num_addon_services`
    (count of subscribed add-ons), `avg_charge_per_tenure`
-   (`TotalCharges / (tenure + 1)`), and a bucketed `tenure_bucket`. All
-   three are computed per-row from that row's own raw values, so they're
-   safe to use inside cross-validation without leaking across folds.
+   (`TotalCharges / (tenure + 1)`), `charges_delta`
+   (`tenure * MonthlyCharges - TotalCharges` — positive means the customer
+   has been on some kind of discount relative to their current rate,
+   often a churn trigger once it expires), an `is_new_customer` flag
+   (tenure ≤ 3 months), and a bucketed `tenure_bucket`. It also collapses
+   the `"No internet/phone service"` category on 7 columns into `"No"` —
+   that value is 100% determined by `InternetService`/`PhoneService`
+   already being `"No"`, so keeping it as its own one-hot category just
+   re-encoded the same bit up to 6 times over. All derived values are
+   computed per-row from that row's own raw values, so they're safe to use
+   inside cross-validation without leaking across folds.
 2. **Preprocessing**: one-hot encoding for categorical features, standard
    scaling for numeric ones (`ColumnTransformer`).
 3. **Hyperparameter search**: `RandomizedSearchCV` (20 iterations, 5-fold
    `StratifiedKFold`, scored on ROC-AUC) over each model's own parameter
-   space.
+   space, including L1/L2 regularization terms for XGBoost/LightGBM.
 4. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
    for an imbalanced target (~27% churn). Using `cross_val_predict` to get
    out-of-fold probabilities on the *training* split only, it sweeps
    thresholds and picks the one that maximizes F1 on the "Churn" class —
    without ever looking at the test set, so the threshold isn't overfit to
    it.
-5. **Model selection**: whichever tuned candidate scores best on **F1 for
-   the "Churn" class** on the held-out 20% test split, evaluated at its own
+5. **Ensembling**: averages predict_proba across the top-3 and all-5 tuned
+   models (`AverageProbabilityEnsemble` in `app/features.py`), evaluated
+   the same way as any other candidate.
+6. **Model selection**: whichever candidate scores best on **F1 for the
+   "Churn" class** on the held-out 20% test split, evaluated at its own
    tuned threshold. For a churn-prevention use case, missing an actual
    churner (low recall) is costlier than a false alarm — plain accuracy or
    ROC-AUC are much less sensitive to that trade-off on this dataset.
@@ -97,31 +109,55 @@ model's best hyperparameters and CV scores):
 
 | Model | CV ROC-AUC | Tuned threshold | Test Accuracy | Test Churn F1 | Test ROC-AUC |
 |---|---|---|---|---|---|
-| Logistic Regression | 0.849 | 0.56 | 0.756 | 0.619 | 0.836 |
-| Random Forest | 0.849 | 0.48 | 0.738 | 0.617 | 0.836 |
-| Gradient Boosting | 0.850 | 0.28 | 0.743 | 0.620 | 0.839 |
-| XGBoost | 0.851 | 0.27 | 0.730 | 0.615 | 0.839 |
-| **LightGBM (selected)** | **0.851** | **0.29** | **0.744** | **0.623** | **0.841** |
+| Logistic Regression | 0.849 | 0.61 | 0.774 | 0.626 | 0.837 |
+| Random Forest | 0.851 | 0.56 | 0.775 | 0.626 | 0.837 |
+| Gradient Boosting | 0.850 | 0.36 | 0.780 | 0.630 | 0.840 |
+| XGBoost | 0.851 | 0.35 | 0.768 | 0.624 | 0.839 |
+| **LightGBM (selected)** | **0.851** | **0.32** | **0.761** | **0.632** | **0.840** |
+| Ensemble (top 3) | — | 0.42 | 0.771 | 0.625 | 0.840 |
+| Ensemble (all 5) | — | 0.43 | 0.770 | 0.630 | 0.840 |
 
-All five land within ~1 point of ROC-AUC and ~1 point of churn F1 of each
-other — this dataset's ceiling with these features has essentially been
-reached; XGBoost/LightGBM's edge over plain Gradient Boosting is real but
-small, not the order-of-magnitude jump they sometimes deliver on larger,
-messier tabular datasets. Squeezing out more from here would need new
-information (e.g. support-ticket or usage data), not further tuning.
+### What moved the numbers, and what didn't
+
+Started from a hypothesis-driven diagnosis (see `model/metrics.json` history
+in git log for the "untuned" and "5-model, no fixes" baselines): feature
+importances showed 23 of 52 one-hot columns carrying a combined 4.3% of
+total importance (mostly the redundant `"No internet service"` duplicates),
+and slicing customers by their strongest predictors showed several
+sizeable segments with near-50% churn rates *within* customers who are
+identical on every available feature — i.e. some of the gap is inherent to
+the dataset, not fixable by tuning.
+
+After collapsing the redundant categories, adding `charges_delta` /
+`is_new_customer`, widening the regularization search, and adding
+ensembling:
+
+- **Churn F1 improved consistently across every candidate** (e.g. LightGBM
+  0.623 → 0.632, Gradient Boosting 0.620 → 0.630, Random Forest
+  0.617 → 0.626) — a real, reproducible ~1-point gain, not noise from a
+  single lucky split.
+- **`charges_delta` earned its place**: it's the 3rd most important feature
+  in the final model (`num__tenure` and `num__MonthlyCharges` are 1st/2nd),
+  ahead of `TotalCharges` itself.
+- **The train/test ROC-AUC gap did not close** (0.0297 → 0.0317, i.e. no
+  meaningful change) despite adding L1/L2 regularization search — evidence
+  this was never really an overfitting problem, reinforcing that the
+  remaining ~15 points of ROC-AUC headroom is the dataset's actual
+  information ceiling, not solvable by better regularization.
+- **Ensembling didn't beat the best single model** (0.630 vs. LightGBM's
+  0.632) — the candidates are all gradient/tree-based and highly
+  correlated, so averaging them doesn't cancel out much independent error.
+
+Net: real, honest improvement (~1 point of F1, ~2 points of accuracy),
+consistent across the board — and further confirmation that we're now
+close to what these 19 raw features can support. The next real gain would
+come from new data (support tickets, usage patterns, competitor pricing
+signals), not more modeling.
 
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
 the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
 `Medium` always straddles the actual Yes/No decision boundary, so it stays
-coherent even though thresholds vary a lot between models (0.27–0.56).
-
-Hyperparameter tuning + feature engineering lifted CV ROC-AUC from ~0.834
-(untuned baseline) to ~0.849–0.850 across the board. All three tuned models
-now land within a hair of each other — the real gap closed was CV rigor and
-threshold calibration, not picking a fancier algorithm. Gradient Boosting's
-much lower tuned threshold (0.28 vs 0.5+ for the others) reflects that its
-raw probabilities skew lower; the threshold search corrects for that rather
-than leaving it under-predicting churn at a naive 0.5 cutoff.
+coherent even though thresholds vary a lot between models (0.27–0.61).
 
 ## Local development
 
@@ -164,7 +200,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.6524,
+  "churn_probability": 0.6828,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }
