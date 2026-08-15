@@ -18,8 +18,13 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
+
+# Quiet TensorFlow's C++ logging before it's imported (the ANN candidate);
+# otherwise every CV fold prints oneDNN/absl banners over the results.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import joblib
 import numpy as np
@@ -46,6 +51,7 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from scikeras.wrappers import KerasClassifier
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # so `python train/train.py` can `import app.*`
@@ -82,6 +88,50 @@ SEARCH_ITER = 20
 # candidate (replaces an earlier SMOTE variant — cross-validated the same
 # way, weight chosen by hyperparameter search rather than a fixed ratio).
 CLASS_WEIGHT_SWEEP = [{0: 1, 1: w} for w in range(1, 31)]
+
+
+class SklearnCompatKerasClassifier(KerasClassifier):
+    """scikeras 0.13's KerasClassifier reports `estimator_type=None` from
+    `__sklearn_tags__()` under scikit-learn 1.8, so `is_classifier()`
+    returns False and every classifier-only scorer (roc_auc, f1, ...)
+    silently yields nan instead of a score. It still sets the legacy
+    `_estimator_type = "classifier"` attribute, which is what earlier
+    sklearn versions read — so this is a version-skew bug between the two
+    libraries, not a misuse. Patch the tag through so CV scoring works."""
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "classifier"
+        return tags
+
+
+def build_ann(hidden_layers=(64, 32), dropout=0.3, meta=None):
+    """Keras feed-forward net for the ANN candidate.
+
+    Deeper/more configurable than the sklearn MLPClassifier candidate
+    (which is a single dense stack with no dropout or batch norm), so the
+    two aren't redundant: this one tests whether a *properly built* net
+    with regularization does better on this tabular data, rather than
+    leaving that assumed from the simple MLP's poor showing.
+
+    scikeras passes `meta` with the fitted data's shape, so the input
+    layer adapts to however many columns one-hot encoding produced.
+    """
+    from tensorflow import keras
+
+    n_features = meta["n_features_in_"]
+    model = keras.Sequential([keras.layers.Input(shape=(n_features,))])
+    for units in hidden_layers:
+        model.add(keras.layers.Dense(units, activation="relu"))
+        model.add(keras.layers.BatchNormalization())
+        model.add(keras.layers.Dropout(dropout))
+    model.add(keras.layers.Dense(1, activation="sigmoid"))
+    model.compile(
+        loss="binary_crossentropy",
+        optimizer=keras.optimizers.Adam(),
+        metrics=["accuracy"],
+    )
+    return model
 
 
 def load_data() -> pd.DataFrame:
@@ -214,6 +264,33 @@ def search_spaces(scale_pos_weight_options: list[float]) -> dict:
                 "model__hidden_layer_sizes": [(32,), (64,), (32, 16), (64, 32)],
                 "model__alpha": [float(x) for x in np.logspace(-4, 0, 10)],
                 "model__learning_rate_init": [0.001, 0.003, 0.01],
+            },
+        ),
+        "ann": (
+            # A proper Keras feed-forward net (batch norm + dropout,
+            # deeper options, class weighting) rather than the plain
+            # sklearn MLP above — so "neural nets don't help here" is
+            # tested against a real architecture, not just the simplest
+            # possible one.
+            SklearnCompatKerasClassifier(
+                model=build_ann,
+                loss="binary_crossentropy",
+                epochs=50,
+                batch_size=64,
+                verbose=0,
+                validation_split=0.15,
+                # scikeras requires model-builder kwargs to be declared on
+                # the constructor before they can be tuned via set_params
+                # (which is how RandomizedSearchCV varies them).
+                hidden_layers=(64, 32),
+                dropout=0.3,
+                random_state=RANDOM_STATE,
+            ),
+            {
+                "model__hidden_layers": [(32,), (64,), (64, 32), (128, 64), (128, 64, 32)],
+                "model__dropout": [0.1, 0.2, 0.3, 0.4],
+                "model__batch_size": [32, 64, 128],
+                "model__class_weight": [None, "balanced"],
             },
         ),
         "gradient_boosting": (

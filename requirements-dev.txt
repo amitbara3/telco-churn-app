@@ -1,3 +1,9 @@
 -r requirements.txt
 pytest==8.3.4
 httpx==0.28.1
+
+# Training-only: the ANN candidate in train/train.py. Deliberately not in
+# requirements.txt — the serving image doesn't need ~250MB of TensorFlow
+# unless the ANN actually wins model selection and gets deployed.
+tensorflow-cpu==2.21.0
+scikeras==0.13.0

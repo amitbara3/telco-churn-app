@@ -67,13 +67,13 @@ requirements.txt
 ## Model
 
 `train/train.py` builds a pipeline of three steps — feature engineering,
-preprocessing, and a classifier — for each of eleven model families
+preprocessing, and a classifier — for each of twelve model families
 (Logistic Regression, Random Forest, Extra Trees, Gradient Boosting,
 HistGradientBoosting (plain and with a wide class-weight sweep), XGBoost,
 LightGBM, CatBoost with one-hot encoding, CatBoost with native categorical
-handling, a small MLP neural net), plus two probability-averaging
-ensembles of the top-3 and all-11, and keeps whichever generalizes best.
-Concretely, per candidate:
+handling, a small sklearn MLP, and a Keras ANN), plus two
+probability-averaging ensembles of the top-3 and all-12, and keeps
+whichever generalizes best. Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): `num_addon_services`
@@ -121,7 +121,7 @@ Concretely, per candidate:
    out-of-fold probabilities on the *training* split only, it sweeps
    thresholds and picks the one that maximizes F1 on the "Churn" class —
    without ever looking at the test set.
-6. **Ensembling**: averages predict_proba across the top-3 and all-11
+6. **Ensembling**: averages predict_proba across the top-3 and all-12
    tuned models (`AverageProbabilityEnsemble` in `app/features.py`).
 7. **Model selection**: whichever candidate scores best on **F1 for the
    "Churn" class** on the held-out 20% test split, evaluated at its own
@@ -142,9 +142,10 @@ model's best hyperparameters and CV scores):
 | LightGBM | 0.849 | 0.47 | 0.774 | 0.633 | 0.837 |
 | CatBoost (one-hot) | 0.851 | 0.59 | 0.770 | 0.627 | 0.839 |
 | **CatBoost (native categoricals, selected)** | **0.850** | **0.47** | **0.779** | **0.636** | **0.840** |
-| MLP (neural net) | 0.847 | 0.26 | 0.738 | 0.610 | 0.836 |
+| MLP (sklearn, shallow) | 0.847 | 0.26 | 0.738 | 0.610 | 0.836 |
+| ANN (Keras, batch norm + dropout) | 0.839 | 0.36 | 0.770 | 0.611 | 0.827 |
 | Ensemble, top 3 | — | 0.49 | 0.772 | 0.631 | 0.839 |
-| Ensemble, all 11 | — | 0.47 | 0.778 | 0.634 | 0.840 |
+| Ensemble, all 12 | — | 0.42 | 0.765 | 0.627 | 0.840 |
 
 ### Class imbalance and K-Means segmentation, tested honestly
 
@@ -180,6 +181,42 @@ rounded up:
   segmentation feature since it helps the majority of candidates and the
   loss is within noise for a single 1,407-row test split, but flagged
   clearly rather than presented as a clean improvement.
+
+### Neural nets: tested twice, properly, and they lose
+
+The first neural-net candidate was a plain `sklearn` `MLPClassifier` — a
+single dense stack, no dropout or normalization. It came last, which is a
+weak result to conclude from: a shallow net losing doesn't tell you much
+about whether a *well-built* net would. So a second, genuinely different
+ANN was added — a Keras feed-forward network with batch normalization,
+dropout, early stopping on a validation split, tunable depth up to
+`(128, 64, 32)`, and optional class weighting (`build_ann` in
+`train/train.py`).
+
+It did worse. **CV ROC-AUC 0.839 — dead last of all twelve candidates**,
+below even the simple MLP (0.847) and well below the tree models
+(0.849–0.851); test F1 0.611 vs. 0.636 for the deployed CatBoost.
+
+The most informative part isn't the score, it's *which* architecture the
+search chose. Free to pick any depth from `(32,)` up to `(128, 64, 32)`,
+cross-validated on ROC-AUC, it settled on the **smallest** option — a
+single 32-unit layer — paired with the **highest** dropout offered (0.4).
+Given more capacity, the search consistently preferred less of it. That's
+the signature of a model class with more flexibility than ~5,600 training
+rows of tabular data can constrain, and it's the same reason gradient
+boosting dominates this problem class. This is now a tested conclusion
+rather than an assumed one, at two different levels of architectural
+effort.
+
+TensorFlow/scikeras therefore live in `requirements-dev.txt`, not
+`requirements.txt` — the training script needs them, the serving image
+doesn't, and there's no reason to ship ~250MB of unused dependency into
+the deployed container. (Getting this candidate running also required a
+small shim: `scikeras` 0.13 reports `estimator_type=None` from
+`__sklearn_tags__()` under scikit-learn 1.8, which makes `is_classifier()`
+return False and silently turns every classifier-only CV score into `nan`.
+`SklearnCompatKerasClassifier` patches the tag through — a genuine
+version-skew bug between the two libraries, not a misuse.)
 
 ### A real bug this surfaced
 
@@ -408,7 +445,8 @@ pip install -r requirements-dev.txt
 
 # Train the model (writes model/churn_model.joblib, decision_threshold.json,
 # metrics.json, feature_schema.json). Runs a hyperparameter search across
-# 11 model families with 5-fold CV, so it takes ~2-3min.
+# 12 model families with 5-fold CV, so it takes ~6min (the Keras ANN
+# candidate accounts for roughly half of that on its own).
 python train/train.py
 
 # Run the tests
