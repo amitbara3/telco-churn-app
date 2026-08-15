@@ -9,9 +9,12 @@ positional indices, so a live request silently fed category strings into
 columns the model expected to be numeric. These tests exist so that class
 of drift fails here instead of in production.
 """
+import json
+
 import joblib
 import pandas as pd
 import pytest
+from sklearn.calibration import CalibratedClassifierCV
 
 from app.features import (
     CATEGORICAL_FEATURES,
@@ -20,6 +23,20 @@ from app.features import (
     FeatureEngineer,
 )
 from app.model import MODEL_PATH, load_pipeline, load_threshold, predict
+
+
+def catboost_models(saved):
+    """The fitted CatBoost estimator(s) inside the saved artifact.
+
+    The deployed model is a CalibratedClassifierCV wrapping one fitted
+    pipeline per calibration fold, so tests can't assume a bare Pipeline.
+    """
+    pipelines = (
+        [c.estimator for c in saved.calibrated_classifiers_]
+        if isinstance(saved, CalibratedClassifierCV)
+        else [saved]
+    )
+    return [p.named_steps["model"] for p in pipelines]
 
 SAMPLE_CUSTOMER = {
     "gender": "Female",
@@ -47,28 +64,25 @@ SAMPLE_CUSTOMER = {
 def test_raw_feature_order_matches_model_inputs():
     """The columns a request is assembled from must be exactly the columns,
     in the same order, that the fitted model was trained on."""
-    pipeline = load_pipeline()
-    model = pipeline.named_steps["model"]
-
-    # Everything FeatureEngineer + the segmenter derive is appended after
-    # the raw columns, so the model's first N features are the raw ones.
-    trained_on = list(model.feature_names_)
-    assert trained_on[: len(RAW_FEATURE_ORDER)] == RAW_FEATURE_ORDER
+    for model in catboost_models(load_pipeline()):
+        # Everything FeatureEngineer + the segmenter derive is appended
+        # after the raw columns, so the first N features are the raw ones.
+        trained_on = list(model.feature_names_)
+        assert trained_on[: len(RAW_FEATURE_ORDER)] == RAW_FEATURE_ORDER
 
 
 def test_categorical_columns_are_registered_as_categorical():
     """CatBoost resolves cat_features positionally. If a categorical column
     isn't registered, it's silently treated as numeric — which either
     crashes on a string or, worse, coerces nonsense."""
-    pipeline = load_pipeline()
-    model = pipeline.named_steps["model"]
-    names = list(model.feature_names_)
-    declared = {names[i] for i in model.get_cat_feature_indices()}
+    for model in catboost_models(load_pipeline()):
+        names = list(model.feature_names_)
+        declared = {names[i] for i in model.get_cat_feature_indices()}
 
-    for col in CATEGORICAL_FEATURES:
-        assert col in declared, f"{col} is categorical but not declared to CatBoost"
-    for col in NUMERIC_FEATURES:
-        assert col not in declared, f"{col} is numeric but declared categorical"
+        for col in CATEGORICAL_FEATURES:
+            assert col in declared, f"{col} is categorical but not declared to CatBoost"
+        for col in NUMERIC_FEATURES:
+            assert col not in declared, f"{col} is numeric but declared categorical"
 
 
 def test_train_and_serve_produce_identical_features():
@@ -129,3 +143,21 @@ def test_boundary_tenures_predict_without_error(tenure):
 def test_model_artifact_exists():
     assert MODEL_PATH.exists(), "run `python train/train.py` first"
     assert joblib.load(MODEL_PATH) is not None
+
+
+def test_model_is_calibrated():
+    """The API returns churn_probability and the UI renders it as a
+    percentage, so the probability scale is part of the contract. An
+    uncalibrated model over-predicted churn by ~7 points; this fails if
+    calibration is ever dropped from training."""
+    assert isinstance(load_pipeline(), CalibratedClassifierCV)
+
+
+def test_reported_calibration_error_is_small():
+    """Guards against a retrain silently regressing calibration."""
+    metrics = json.loads((MODEL_PATH.parent / "metrics.json").read_text())["test_metrics"]
+    assert metrics["expected_calibration_error"] < 0.04
+    # Average predicted probability should track the real churn rate.
+    assert abs(
+        metrics["mean_predicted_probability"] - metrics["observed_churn_rate"]
+    ) < 0.03

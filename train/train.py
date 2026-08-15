@@ -11,10 +11,17 @@ here — see README for the results table and the reasoning.
 Pipeline:
   1. Hyperparameter search on the training split (5-fold stratified CV,
      scored on ROC-AUC, which is threshold-independent).
-  2. Pick a decision threshold by sweeping F1 on the "Churn" class over
+  2. Wrap the tuned pipeline in Platt scaling (CalibratedClassifierCV,
+     method="sigmoid") so the returned probabilities mean what they say.
+     Without this the model over-predicts churn by ~7 points on average —
+     scale_pos_weight buys recall by distorting the probability scale, and
+     the API/UI present that number to a human as a percentage.
+  3. Pick a decision threshold by sweeping F1 on the "Churn" class over
      out-of-fold predictions on the *training* split (cross_val_predict) —
      this never looks at the test set, so the threshold isn't overfit to it.
-  3. Evaluate once on the held-out test split.
+  4. Evaluate once on the held-out test split, reporting calibration
+     quality (Brier score, expected calibration error) alongside the usual
+     classification metrics.
 
 Saves the fitted pipeline, its decision threshold, metrics, feature
 importances, and a feature schema (for the API/UI) under ./model/.
@@ -32,9 +39,11 @@ import joblib
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
+    brier_score_loss,
     classification_report,
     f1_score,
     roc_auc_score,
@@ -151,6 +160,19 @@ def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
     return best_t, best_f1
 
 
+def expected_calibration_error(y_true, y_proba, n_bins: int = 10) -> float:
+    """Average gap between predicted probability and observed frequency,
+    weighted by how many predictions fall in each bin. 0 is perfect."""
+    frac_positive, mean_predicted = calibration_curve(
+        y_true, y_proba, n_bins=n_bins, strategy="uniform"
+    )
+    counts, _ = np.histogram(y_proba, bins=np.linspace(0, 1, n_bins + 1))
+    populated = counts[counts > 0]
+    return float(
+        np.sum(np.abs(frac_positive - mean_predicted) * populated / len(y_proba))
+    )
+
+
 def evaluate_at_threshold(y_true, y_proba, threshold: float) -> dict:
     preds = (y_proba >= threshold).astype(int)
     return {
@@ -158,20 +180,43 @@ def evaluate_at_threshold(y_true, y_proba, threshold: float) -> dict:
         "balanced_accuracy": balanced_accuracy_score(y_true, preds),
         "f1": f1_score(y_true, preds),
         "roc_auc": roc_auc_score(y_true, y_proba),
+        # Calibration quality. The API returns churn_probability and the UI
+        # renders it as a percentage, so "is 0.7 actually 70%?" is a
+        # correctness question, not a nicety.
+        "brier_score": brier_score_loss(y_true, y_proba),
+        "expected_calibration_error": expected_calibration_error(y_true, y_proba),
+        "mean_predicted_probability": float(np.mean(y_proba)),
+        "observed_churn_rate": float(np.mean(y_true)),
         "classification_report": classification_report(
             y_true, preds, target_names=["No Churn", "Churn"], output_dict=True
         ),
     }
 
 
-def extract_feature_importance(pipeline: Pipeline) -> pd.Series:
+def inner_pipelines(model) -> list[Pipeline]:
+    """The fitted Pipeline(s) inside whatever was saved.
+
+    CalibratedClassifierCV holds one fitted copy of the pipeline per CV
+    fold, so anything that wants at the underlying CatBoost model has to
+    go through this rather than assuming a bare Pipeline.
+    """
+    if isinstance(model, CalibratedClassifierCV):
+        return [c.estimator for c in model.calibrated_classifiers_]
+    return [model]
+
+
+def extract_feature_importance(model) -> pd.Series:
     """CatBoost's own feature importances, normalized to sum to 1 and
-    labelled with the column names it was fit on."""
-    model = pipeline.named_steps["model"]
-    values = np.asarray(model.feature_importances_, dtype=float)
-    if values.sum() > 0:
-        values = values / values.sum()
-    return pd.Series(values, index=model.feature_names_).sort_values(ascending=False)
+    labelled with the column names it was fit on. Averaged across the
+    calibration folds, since each holds its own fitted CatBoost."""
+    per_fold = []
+    for pipe in inner_pipelines(model):
+        cb = pipe.named_steps["model"]
+        values = np.asarray(cb.feature_importances_, dtype=float)
+        if values.sum() > 0:
+            values = values / values.sum()
+        per_fold.append(pd.Series(values, index=cb.feature_names_))
+    return pd.concat(per_fold, axis=1).mean(axis=1).sort_values(ascending=False)
 
 
 def main() -> None:
@@ -205,19 +250,30 @@ def main() -> None:
         refit=True,
     )
     search.fit(X_train, y_train, **FIT_PARAMS)
-    pipeline = search.best_estimator_
     cv_std = float(search.cv_results_["std_test_score"][search.best_index_])
 
-    # Out-of-fold probabilities on the *training* split, using the tuned
-    # hyperparameters, so the threshold is picked without ever touching the
-    # held-out test set.
+    # Platt-scale the tuned pipeline. scale_pos_weight buys churn recall by
+    # inflating predicted probabilities — measured at ~7 points of upward
+    # bias, with mid-range bins off by 10-15 — and the API hands that number
+    # to a human as a percentage. Calibrating is monotonic, so ranking
+    # (ROC-AUC) is preserved while the numbers become meaningful.
+    # method="sigmoid" over "isotonic": both calibrate well here, but
+    # isotonic measurably cost F1 and balanced accuracy at this sample size.
+    calibrated = CalibratedClassifierCV(
+        build_pipeline().set_params(**search.best_params_), method="sigmoid", cv=cv
+    )
+    calibrated.fit(X_train, y_train, **FIT_PARAMS)
+
+    # Out-of-fold probabilities on the *training* split, from the calibrated
+    # model, so the threshold matches the probability scale actually served
+    # and is picked without ever touching the held-out test set.
     oof_proba = cross_val_predict(
-        pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1,
+        calibrated, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1,
         params=FIT_PARAMS,
     )[:, 1]
     threshold, oof_f1 = best_threshold_for_f1(y_train, oof_proba)
 
-    test_proba = pipeline.predict_proba(X_test)[:, 1]
+    test_proba = calibrated.predict_proba(X_test)[:, 1]
     test_metrics = evaluate_at_threshold(y_test, test_proba, threshold)
 
     print(
@@ -227,16 +283,21 @@ def main() -> None:
         f"Test: f1={test_metrics['f1']:.4f}  "
         f"balanced_acc={test_metrics['balanced_accuracy']:.4f}  "
         f"acc={test_metrics['accuracy']:.4f}  "
-        f"roc_auc={test_metrics['roc_auc']:.4f}"
+        f"roc_auc={test_metrics['roc_auc']:.4f}\n"
+        f"Calibration: brier={test_metrics['brier_score']:.4f}  "
+        f"ECE={test_metrics['expected_calibration_error']:.4f}  "
+        f"mean_predicted={test_metrics['mean_predicted_probability']:.4f} "
+        f"vs actual churn rate {test_metrics['observed_churn_rate']:.4f}"
     )
     print(f"Best params: {search.best_params_}")
 
-    joblib.dump(pipeline, MODEL_PATH)
+    joblib.dump(calibrated, MODEL_PATH)
     THRESHOLD_PATH.write_text(json.dumps({"threshold": threshold}, indent=2))
     METRICS_PATH.write_text(
         json.dumps(
             {
                 "model": "catboost_native",
+                "calibration": "sigmoid",
                 "best_params": search.best_params_,
                 "cv_roc_auc_mean": float(search.best_score_),
                 "cv_roc_auc_std": cv_std,
@@ -248,7 +309,7 @@ def main() -> None:
         )
     )
 
-    importance = extract_feature_importance(pipeline)
+    importance = extract_feature_importance(calibrated)
     IMPORTANCE_PATH.write_text(
         json.dumps(
             [

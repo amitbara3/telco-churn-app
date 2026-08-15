@@ -81,17 +81,23 @@ training, tuning, or threshold selection):
 
 | Metric | Value |
 |---|---|
-| Churn F1 | **0.634** |
+| Churn F1 | **0.636** |
 | Balanced accuracy | **0.764** |
-| Accuracy | 0.770 |
+| Accuracy | 0.776 |
 | ROC-AUC | 0.846 |
-| Churn recall | 0.751 |
-| Churn precision | 0.549 |
+| Churn recall | 0.738 |
+| Churn precision | 0.559 |
+| Brier score | 0.136 |
+| Expected calibration error | 0.020 |
 
-In plain terms: of customers who actually churn, the model flags ~75%; of
-those it flags, ~55% actually churn. For a retention use case that's the
+In plain terms: of customers who actually churn, the model flags ~74%; of
+those it flags, ~56% actually churn. For a retention use case that's the
 right side of the trade — a missed churner costs more than a wasted
 retention offer.
+
+The last two rows matter as much as the first: the model's probabilities
+are **calibrated**, so a customer scored at 0.70 really does churn about
+70% of the time. That isn't automatic — see below.
 
 How `train/train.py` gets there:
 
@@ -120,12 +126,57 @@ How `train/train.py` gets there:
    `StratifiedKFold`, scored on ROC-AUC) over depth, iterations, learning
    rate, `l2_leaf_reg`, and `scale_pos_weight` (searched over `[1.0,
    sqrt(imbalance ratio), imbalance ratio]`).
-3. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
+3. **Probability calibration**: the tuned pipeline is wrapped in Platt
+   scaling (`CalibratedClassifierCV`, `method="sigmoid"`, fit with its own
+   internal CV on the training split). See the calibration section below
+   for why this is a correctness fix rather than a refinement.
+4. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
    for an imbalanced target (~27% churn). Using `cross_val_predict` to get
    out-of-fold probabilities on the *training* split only, it sweeps
    thresholds and picks the one maximizing F1 on the "Churn" class —
    without ever looking at the test set, so the threshold isn't overfit to
-   it. The tuned value lands at 0.44.
+   it. The tuned value lands at 0.31. (It's tuned on the *calibrated*
+   model's out-of-fold probabilities, so the threshold and the served
+   probability scale always agree.)
+
+### Calibration: the probabilities now mean what they say
+
+The API returns `churn_probability` and the Streamlit UI renders it as a
+percentage. That makes the probability *scale* part of the product's
+contract, not just an internal score — and it was wrong.
+
+`scale_pos_weight` buys churn recall by inflating predicted probabilities.
+Measuring on the held-out test set showed a systematic upward bias: mean
+predicted probability 0.336 against an actual churn rate of 0.265, with
+**every** mid-range bin over-predicting by 10–15 points. Customers the UI
+labelled "55.2% likely to churn" actually churned 40.5% of the time. This
+is a known and documented side effect of class weighting, not a quirk of
+this dataset.
+
+Wrapping the model in Platt scaling fixes it, and the classification
+metrics come along for free rather than paying for it:
+
+| | ECE | Brier | Churn F1 | Bal. Acc | ROC-AUC |
+|---|---|---|---|---|---|
+| Uncalibrated | 0.072 | 0.142 | 0.634 | 0.764 | 0.846 |
+| **Platt / sigmoid (deployed)** | **0.020** | **0.136** | **0.636** | 0.764 | **0.846** |
+| Isotonic | 0.015 | 0.135 | 0.630 | 0.755 | 0.845 |
+
+Calibration error drops by ~72% and every classification metric holds or
+improves slightly. Isotonic calibrates marginally better but measurably
+costs F1 and balanced accuracy — the usual small-sample overfitting, with
+~5,600 training rows — so sigmoid is the better trade here.
+
+Because both methods are monotonic, ranking is untouched, which is why
+ROC-AUC barely moves; what changes is that the numbers are now usable for
+decisions rather than just ordering. Costs: the artifact grows from 0.14 MB
+to 0.71 MB (one fitted model per calibration fold) and prediction latency
+rises from ~0.02 ms to ~0.07 ms per row — both irrelevant at this scale.
+Training goes from ~2 min to ~2.5 min.
+
+`tests/test_pipeline.py` asserts both that the deployed artifact *is*
+calibrated and that reported calibration error stays under 0.04, so a
+future retrain can't silently reintroduce the bias.
 
 ### The model comparison that led here
 
@@ -265,35 +316,36 @@ column*, not per category level. Top 5:
 
 | Feature | Importance |
 |---|---|
-| `Contract` | 20.5% |
-| `InternetService` | 18.5% |
-| `tenure` | 9.5% |
-| `MonthlyCharges` | 5.7% |
-| `TotalCharges` | 5.5% |
+| `Contract` | 23.7% |
+| `InternetService` | 14.8% |
+| `tenure` | 10.1% |
+| `MonthlyCharges` | 6.5% |
+| `PaymentMethod` | 5.1% |
 
 ...and the tail — the 10 least useful of the 29 raw + engineered columns:
 
 | Feature | Importance |
 |---|---|
-| `TechSupport` | 0.82% |
-| `StreamingTV` | 0.78% |
-| `manual_payment` | 0.62% |
-| `SeniorCitizen` | 0.56% |
-| `Dependents` | 0.51% |
-| `gender` | 0.44% |
-| `has_streaming` | 0.41% |
-| `OnlineBackup` | 0.09% |
-| `Partner` | 0.07% |
-| `DeviceProtection` | 0.01% (effectively unused, as in every earlier run) |
+| `TechSupport` | 1.12% |
+| `StreamingTV` | 1.07% |
+| `SeniorCitizen` | 0.69% |
+| `Dependents` | 0.67% |
+| `has_streaming` | 0.60% |
+| `gender` | 0.50% |
+| `OnlineBackup` | 0.38% |
+| `manual_payment` | 0.27% |
+| `DeviceProtection` | 0.12% |
+| `Partner` | 0.02% (effectively unused, as in every earlier run) |
 
-Only 5 of 29 columns fall below the 0.5%-each dead-weight threshold,
-carrying 1.0% between them — much cleaner than the one-hot-expanded counts
-earlier in this project, though those were never comparing like for like
-(one raw column vs. several one-hot levels of it). `Contract` and
-`InternetService` alone account for 39% of total importance, consistent
-with every other lens applied to this dataset — segment analysis,
-permutation importance, and the reference paper's SHAP results all agree
-these two (plus tenure) carry most of the real signal.
+Values are averaged across the five calibration folds, each of which holds
+its own fitted CatBoost. Only 4 of 29 columns fall below the 0.5%-each
+dead-weight threshold, carrying 0.8% between them — much cleaner than the
+one-hot-expanded counts earlier in this project, though those were never
+comparing like for like (one raw column vs. several one-hot levels of it).
+`Contract` and `InternetService` alone account for 38% of total
+importance, consistent with every other lens applied to this dataset —
+segment analysis, permutation importance, and the reference paper's SHAP
+results all agree these two (plus tenure) carry most of the real signal.
 
 ### Where the ceiling actually is
 
@@ -371,9 +423,28 @@ via the `model__cat_features=...` fit-param convention, sidestepping
 `clone()` entirely.
 
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
-the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
-`Medium` always straddles the actual Yes/No decision boundary, so it stays
-coherent even though thresholds vary a lot between models (0.26–0.63).
+the tuned threshold rather than fixed 0.33/0.66 cutoffs, so `Medium`
+always straddles the actual Yes/No decision boundary. That matters here
+because the threshold has ranged from 0.26 to 0.63 across models and
+moved again (0.44 → 0.31) when calibration rescaled the probabilities;
+hardcoded bands would have silently desynced from the decision boundary.
+
+### Not done: profit-driven thresholds
+
+The threshold is tuned for F1, which treats a missed churner and a wasted
+retention offer as equally costly. They usually aren't. Current work in
+this area ([e-Profits](https://arxiv.org/abs/2507.08860)) selects the
+threshold — and even the model — by expected profit, using customer
+lifetime value, intervention cost, and tenure-conditioned retention
+probability.
+
+That's the right next step, and it's deliberately *not* implemented here:
+it needs real CLV and campaign-cost figures, and inventing them would
+produce something that looks rigorous while being arbitrary. The
+groundwork is done, though — cost-based thresholding requires calibrated
+probabilities to be meaningful, and those now exist. With real numbers,
+swapping `best_threshold_for_f1` for an expected-cost objective is a small
+change to one function.
 
 ## Local development
 
@@ -384,7 +455,8 @@ pip install -r requirements-dev.txt
 
 # Train the model (writes model/churn_model.joblib, decision_threshold.json,
 # metrics.json, feature_importance.json, feature_schema.json). Runs a
-# 20-iteration hyperparameter search with 5-fold CV, so it takes ~2min.
+# 20-iteration hyperparameter search with 5-fold CV, plus calibration
+# (which fits one model per fold), so it takes ~2.5min.
 python train/train.py
 
 # Run the tests
@@ -416,7 +488,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.7573,
+  "churn_probability": 0.6947,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }

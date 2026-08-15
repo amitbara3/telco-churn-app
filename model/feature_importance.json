@@ -1,118 +1,118 @@
 [
   {
     "feature": "Contract",
-    "importance": 0.204563
+    "importance": 0.236892
   },
   {
     "feature": "InternetService",
-    "importance": 0.185402
+    "importance": 0.147749
   },
   {
     "feature": "tenure",
-    "importance": 0.095016
+    "importance": 0.10119
   },
   {
     "feature": "MonthlyCharges",
-    "importance": 0.057431
-  },
-  {
-    "feature": "TotalCharges",
-    "importance": 0.055499
-  },
-  {
-    "feature": "high_risk_new_customer",
-    "importance": 0.049813
+    "importance": 0.065124
   },
   {
     "feature": "PaymentMethod",
-    "importance": 0.048747
-  },
-  {
-    "feature": "avg_charge_per_tenure",
-    "importance": 0.037431
-  },
-  {
-    "feature": "tenure_bucket",
-    "importance": 0.031914
-  },
-  {
-    "feature": "num_addon_services",
-    "importance": 0.028222
+    "importance": 0.05061
   },
   {
     "feature": "discount_ratio",
-    "importance": 0.024653
+    "importance": 0.036336
+  },
+  {
+    "feature": "avg_charge_per_tenure",
+    "importance": 0.03552
+  },
+  {
+    "feature": "tenure_bucket",
+    "importance": 0.033779
+  },
+  {
+    "feature": "high_risk_new_customer",
+    "importance": 0.031512
+  },
+  {
+    "feature": "TotalCharges",
+    "importance": 0.030096
   },
   {
     "feature": "charges_delta",
-    "importance": 0.023714
-  },
-  {
-    "feature": "customer_segment",
-    "importance": 0.02235
+    "importance": 0.027707
   },
   {
     "feature": "is_new_customer",
-    "importance": 0.022031
+    "importance": 0.024254
   },
   {
-    "feature": "MultipleLines",
-    "importance": 0.016489
+    "feature": "customer_segment",
+    "importance": 0.02402
   },
   {
     "feature": "PaperlessBilling",
-    "importance": 0.016433
+    "importance": 0.02172
+  },
+  {
+    "feature": "num_addon_services",
+    "importance": 0.0212
   },
   {
     "feature": "OnlineSecurity",
-    "importance": 0.015781
+    "importance": 0.019559
+  },
+  {
+    "feature": "MultipleLines",
+    "importance": 0.01377
   },
   {
     "feature": "StreamingMovies",
-    "importance": 0.012846
+    "importance": 0.012337
   },
   {
     "feature": "PhoneService",
-    "importance": 0.008553
+    "importance": 0.012099
   },
   {
     "feature": "TechSupport",
-    "importance": 0.008214
+    "importance": 0.011227
   },
   {
     "feature": "StreamingTV",
-    "importance": 0.007778
-  },
-  {
-    "feature": "manual_payment",
-    "importance": 0.006167
+    "importance": 0.010709
   },
   {
     "feature": "SeniorCitizen",
-    "importance": 0.005639
+    "importance": 0.006925
   },
   {
     "feature": "Dependents",
-    "importance": 0.005109
-  },
-  {
-    "feature": "gender",
-    "importance": 0.004359
+    "importance": 0.006716
   },
   {
     "feature": "has_streaming",
-    "importance": 0.004075
+    "importance": 0.005965
+  },
+  {
+    "feature": "gender",
+    "importance": 0.005041
   },
   {
     "feature": "OnlineBackup",
-    "importance": 0.000883
+    "importance": 0.003798
   },
   {
-    "feature": "Partner",
-    "importance": 0.000744
+    "feature": "manual_payment",
+    "importance": 0.002675
   },
   {
     "feature": "DeviceProtection",
-    "importance": 0.000143
+    "importance": 0.001232
+  },
+  {
+    "feature": "Partner",
+    "importance": 0.000237
   }
 ]
