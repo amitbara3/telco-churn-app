@@ -9,7 +9,6 @@ Every derived feature here is computed from a single row's own raw values
 (no cross-row aggregates/statistics), so it's safe to use inside
 cross-validation without leaking information across folds.
 """
-import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.cluster import KMeans
@@ -82,17 +81,12 @@ HIGH_RISK_TENURE_MONTHS = 12
 # arXiv:2607.10260, engineered an equivalent "payment stability" feature).
 MANUAL_PAYMENT_METHODS = {"Electronic check", "Mailed check"}
 
+# Engineered columns CatBoost must treat as categorical. The engineered
+# numeric columns aren't enumerated anywhere: CatBoost consumes the whole
+# frame and treats everything not listed as categorical as numeric, so
+# FeatureEngineer.transform() below is the single definition of what
+# exists.
 ENGINEERED_CATEGORICAL = ["tenure_bucket", "customer_segment"]
-ENGINEERED_NUMERIC = [
-    "num_addon_services",
-    "avg_charge_per_tenure",
-    "charges_delta",
-    "is_new_customer",
-    "discount_ratio",
-    "has_streaming",
-    "high_risk_new_customer",
-    "manual_payment",
-]
 
 
 class FeatureEngineer(BaseEstimator, TransformerMixin):
@@ -173,23 +167,3 @@ class CustomerSegmentFeature(BaseEstimator, TransformerMixin):
             self.kmeans_.predict(scaled), index=X.index
         ).astype(str)
         return X
-
-
-class AverageProbabilityEnsemble(BaseEstimator):
-    """Averages predict_proba across a set of already-fitted pipelines.
-
-    Used when a simple probability-average blend of several tuned model
-    families generalizes better than any single one of them — a standard
-    way to gain ground once individually-tuned candidates have converged
-    to similar performance.
-    """
-
-    def __init__(self, fitted_pipelines: list):
-        self.fitted_pipelines = fitted_pipelines
-
-    def predict_proba(self, X):
-        probas = np.stack([p.predict_proba(X) for p in self.fitted_pipelines])
-        return probas.mean(axis=0)
-
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)

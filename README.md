@@ -54,7 +54,7 @@ data/
 model/
   churn_model.joblib   Trained scikit-learn Pipeline (feature eng. + preprocessing + model)
   decision_threshold.json  Tuned churn/no-churn probability cutoff
-  metrics.json          Evaluation metrics for all candidate models
+  metrics.json          Evaluation metrics + chosen hyperparameters
   feature_importance.json  Full ranked feature importances of the deployed model
   feature_schema.json    Allowed categories / numeric ranges, used by the UI
 tests/
@@ -66,14 +66,31 @@ requirements.txt
 
 ## Model
 
-`train/train.py` builds a pipeline of three steps — feature engineering,
-preprocessing, and a classifier — for each of twelve model families
-(Logistic Regression, Random Forest, Extra Trees, Gradient Boosting,
-HistGradientBoosting (plain and with a wide class-weight sweep), XGBoost,
-LightGBM, CatBoost with one-hot encoding, CatBoost with native categorical
-handling, a small sklearn MLP, and a Keras ANN), plus two
-probability-averaging ensembles of the top-3 and all-12, and keeps
-whichever generalizes best. Concretely, per candidate:
+The deployed model is **CatBoost using native categorical handling** — it
+consumes the raw category strings directly via `cat_features`, with no
+one-hot encoding step at all. It was chosen by comparing twelve model
+families under the protocol below; that comparison is summarized further
+down and preserved in git history, but `train/train.py` now trains only
+the winner, so a retrain takes ~2 minutes instead of ~6.
+
+**Held-out test performance** (1,407 customers, never touched during
+training, tuning, or threshold selection):
+
+| Metric | Value |
+|---|---|
+| Churn F1 | **0.636** |
+| Balanced accuracy | **0.763** |
+| Accuracy | 0.779 |
+| ROC-AUC | 0.840 |
+| Churn recall | 0.727 |
+| Churn precision | 0.566 |
+
+In plain terms: of customers who actually churn, the model flags ~73%; of
+those it flags, ~57% actually churn. For a retention use case that's the
+right side of the trade — a missed churner costs more than a wasted
+retention offer.
+
+How `train/train.py` gets there:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): `num_addon_services`
@@ -87,136 +104,95 @@ whichever generalizes best. Concretely, per candidate:
    strongest individual predictors: month-to-month contract *and*
    tenure ≤ 12 months), `has_streaming` and `manual_payment` flags, a
    bucketed `tenure_bucket`, and a **K-Means `customer_segment`**
-   (`CustomerSegmentFeature` — 3 clusters on tenure/charges/service-count,
-   inspired by the same independent benchmark's value-segmentation
-   analysis). Unlike the others, the segment feature genuinely needs
-   *fitting* (cluster centers learned from data), so it's its own pipeline
-   step rather than a stateless row-wise formula — cross-validation still
-   fits it fold-by-fold, so no leakage. It also collapses the
+   (`CustomerSegmentFeature` — 3 clusters on tenure/charges/service-count).
+   Unlike the others, the segment feature genuinely needs *fitting*
+   (cluster centers learned from data), so it's its own pipeline step
+   rather than a stateless row-wise formula — cross-validation still fits
+   it fold-by-fold, so no leakage. It also collapses the
    `"No internet/phone service"` category on 7 columns into `"No"` — that
    value is 100% determined by `InternetService`/`PhoneService` already
-   being `"No"`, so keeping it as its own one-hot category just re-encoded
-   the same bit up to 6 times over.
-2. **Preprocessing**: one-hot encoding + standard scaling
-   (`ColumnTransformer`) for every candidate except CatBoost-native, which
-   consumes the raw category strings directly via CatBoost's built-in
-   `cat_features` handling — no one-hot step at all for that one.
-3. **Hyperparameter search**: `RandomizedSearchCV` (20 iterations, 5-fold
-   `StratifiedKFold`, scored on ROC-AUC) over each model's own parameter
-   space — L1/L2 regularization for XGBoost/LightGBM/CatBoost, and
-   `scale_pos_weight` searched over `[1.0, sqrt(imbalance ratio),
-   imbalance ratio]` for every boosting model.
-4. **Class imbalance, a wide weight sweep**: one HistGradientBoosting
-   variant searches `class_weight` over `{0: 1, 1: w}` for every integer
-   `w` from 1 to 30 (`CLASS_WEIGHT_SWEEP`) — much wider than the narrow
-   `scale_pos_weight` range (max ~2.76) used elsewhere, cross-validated the
-   same way as every other hyperparameter. (An earlier version of this
-   tried SMOTE oversampling instead, via `imblearn.pipeline.Pipeline` so
-   the sampler only ever touches a fold's training rows — never leaking
-   into validation/test. It scored worse than doing nothing special for
-   imbalance, so it was replaced with this weight sweep rather than kept
-   as dead weight in the pipeline.)
-5. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
+   being `"No"`, so keeping it as a distinct category just re-encoded the
+   same bit up to 6 times over.
+2. **Hyperparameter search**: `RandomizedSearchCV` (20 iterations, 5-fold
+   `StratifiedKFold`, scored on ROC-AUC) over depth, iterations, learning
+   rate, `l2_leaf_reg`, and `scale_pos_weight` (searched over `[1.0,
+   sqrt(imbalance ratio), imbalance ratio]`).
+3. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
    for an imbalanced target (~27% churn). Using `cross_val_predict` to get
    out-of-fold probabilities on the *training* split only, it sweeps
-   thresholds and picks the one that maximizes F1 on the "Churn" class —
-   without ever looking at the test set.
-6. **Ensembling**: averages predict_proba across the top-3 and all-12
-   tuned models (`AverageProbabilityEnsemble` in `app/features.py`).
-7. **Model selection**: whichever candidate scores best on **F1 for the
-   "Churn" class** on the held-out 20% test split, evaluated at its own
-   tuned threshold.
+   thresholds and picks the one maximizing F1 on the "Churn" class —
+   without ever looking at the test set, so the threshold isn't overfit to
+   it. The tuned value lands at 0.47.
 
-Current results (see `model/metrics.json` for full detail, including each
-model's best hyperparameters and CV scores):
+### The model comparison that led here
 
-| Model | CV ROC-AUC | Tuned threshold | Test Accuracy | Test Churn F1 | Test ROC-AUC |
-|---|---|---|---|---|---|
-| Logistic Regression | 0.849 | 0.63 | 0.785 | 0.628 | 0.838 |
-| Random Forest | 0.851 | 0.55 | 0.772 | 0.624 | 0.837 |
-| Extra Trees | 0.849 | 0.55 | 0.759 | 0.622 | 0.837 |
-| Gradient Boosting | 0.850 | 0.33 | 0.765 | 0.624 | 0.839 |
-| HistGradientBoosting | 0.848 | 0.29 | 0.749 | 0.624 | 0.835 |
-| HistGradientBoosting + weight sweep (1-30) | 0.846 | 0.30 | 0.754 | 0.622 | 0.838 |
-| XGBoost | 0.850 | 0.35 | 0.775 | 0.631 | 0.838 |
-| LightGBM | 0.849 | 0.47 | 0.774 | 0.633 | 0.837 |
-| CatBoost (one-hot) | 0.851 | 0.59 | 0.770 | 0.627 | 0.839 |
-| **CatBoost (native categoricals, selected)** | **0.850** | **0.47** | **0.779** | **0.636** | **0.840** |
-| MLP (sklearn, shallow) | 0.847 | 0.26 | 0.738 | 0.610 | 0.836 |
-| ANN (Keras, batch norm + dropout) | 0.839 | 0.36 | 0.770 | 0.611 | 0.827 |
-| Ensemble, top 3 | — | 0.49 | 0.772 | 0.631 | 0.839 |
-| Ensemble, all 12 | — | 0.42 | 0.765 | 0.627 | 0.840 |
+Twelve model families were run through the identical protocol above. The
+full results table and per-model hyperparameters are in git history
+(`git log -- model/metrics.json`); the summary:
 
-### Class imbalance and K-Means segmentation, tested honestly
+| Model | CV ROC-AUC | Test Churn F1 | Test Bal. Acc |
+|---|---|---|---|
+| **CatBoost (native categoricals)** — deployed | 0.850 | **0.636** | **0.763** |
+| LightGBM | 0.849 | 0.633 | 0.761 |
+| XGBoost | 0.850 | 0.631 | 0.758 |
+| Ensemble (top 3) | — | 0.631 | 0.759 |
+| Logistic Regression | 0.849 | 0.628 | 0.752 |
+| CatBoost (one-hot) | 0.851 | 0.627 | 0.756 |
+| Gradient Boosting / HistGradientBoosting | 0.848–0.850 | 0.624 | 0.755–0.760 |
+| Random Forest / Extra Trees | 0.849–0.851 | 0.622–0.624 | 0.752–0.755 |
+| ANN (Keras, batch norm + dropout) | 0.839 | 0.611 | 0.741 |
+| MLP (sklearn, shallow) | 0.847 | 0.610 | 0.749 |
 
-Both techniques came directly out of researching how other work approaches
-this dataset. Neither is a clean win — reported exactly as measured, not
-rounded up:
+Two things worth carrying forward from that exercise:
 
-- **Neither SMOTE nor a wide weight sweep beat plain threshold tuning.**
-  SMOTE was tried first (correctly, via `imblearn`'s leakage-safe
-  pipeline) and scored *worse* than doing nothing special for imbalance
-  (test F1 0.619 vs. 0.624 for plain `HistGradientBoosting`) — the honest
-  counterpoint to several sources claiming big wins from SMOTE on this
-  dataset. Replaced with a much wider `class_weight` sweep (`{0:1, 1:w}`
-  for `w` in 1–30, vs. the narrow ~1–2.76 range used elsewhere) to see if
-  aggressive loss-reweighting fared better: also worse (0.622), and
-  tellingly, the hyperparameter search — free to pick any of the 30
-  weights via cross-validated ROC-AUC — settled on **`w=1`, i.e. no extra
-  weighting at all**. That's a clean signal, not just a negative result:
-  our existing threshold-tuning step already captures whatever a
-  reweighted loss function would buy here, so stacking another
-  imbalance-correction on top is redundant, not additive.
-- **K-Means `customer_segment` was a genuinely mixed result.** Added to
-  *every* candidate's feature set (not just one), it improved most of them
-  slightly (Logistic Regression 0.622→0.628, LightGBM 0.627→0.633, CatBoost
-  native 0.630→0.636) but made `HistGradientBoosting` — the model that had
-  been winning — measurably *worse* (0.638→0.624). That's large enough to
-  flip which model wins overall, and the new best (CatBoost native, 0.636)
-  is a hair below the immediately preceding deployment (0.638). Same
-  dynamic as the earlier `scale_pos_weight` case: adding a feature or
-  search dimension without adding search budget can quietly hurt whichever
-  model happened to be tuned tightest around the old feature set, even
-  while helping most others. Net effect here is close to a wash — kept the
-  segmentation feature since it helps the majority of candidates and the
-  loss is within noise for a single 1,407-row test split, but flagged
-  clearly rather than presented as a clean improvement.
+- **The field is extremely tight.** Twelve genuinely different algorithms
+  span ~2 points of balanced accuracy. That's the signature of a ceiling
+  set by the data, not the model — a conclusion independently corroborated
+  by a published benchmark on this same dataset (see below) and by segment
+  analysis showing near-coin-flip churn rates among customers identical on
+  every available feature.
+- **Neural nets lose, tested twice.** A shallow sklearn MLP and a properly
+  built Keras ANN (batch norm, dropout, early stopping, depth up to
+  `(128, 64, 32)`) finished last and second-to-last. The telling detail:
+  given free choice of depth, the ANN's search settled on the *smallest*
+  architecture offered with the *highest* dropout — more capacity than
+  ~5,600 rows of tabular data can constrain.
 
-### Neural nets: tested twice, properly, and they lose
+### What was tried and rejected
 
-The first neural-net candidate was a plain `sklearn` `MLPClassifier` — a
-single dense stack, no dropout or normalization. It came last, which is a
-weak result to conclude from: a shallow net losing doesn't tell you much
-about whether a *well-built* net would. So a second, genuinely different
-ANN was added — a Keras feed-forward network with batch normalization,
-dropout, early stopping on a validation split, tunable depth up to
-`(128, 64, 32)`, and optional class weighting (`build_ann` in
-`train/train.py`).
+Several techniques were tried and *rejected* on measured evidence. They're
+recorded here because a negative result you can point at is worth more
+than an untested assumption — and because each one is a thing a reviewer
+would otherwise reasonably ask "did you try…?" about.
 
-It did worse. **CV ROC-AUC 0.839 — dead last of all twelve candidates**,
-below even the simple MLP (0.847) and well below the tree models
-(0.849–0.851); test F1 0.611 vs. 0.636 for the deployed CatBoost.
-
-The most informative part isn't the score, it's *which* architecture the
-search chose. Free to pick any depth from `(32,)` up to `(128, 64, 32)`,
-cross-validated on ROC-AUC, it settled on the **smallest** option — a
-single 32-unit layer — paired with the **highest** dropout offered (0.4).
-Given more capacity, the search consistently preferred less of it. That's
-the signature of a model class with more flexibility than ~5,600 training
-rows of tabular data can constrain, and it's the same reason gradient
-boosting dominates this problem class. This is now a tested conclusion
-rather than an assumed one, at two different levels of architectural
-effort.
-
-TensorFlow/scikeras therefore live in `requirements-dev.txt`, not
-`requirements.txt` — the training script needs them, the serving image
-doesn't, and there's no reason to ship ~250MB of unused dependency into
-the deployed container. (Getting this candidate running also required a
-small shim: `scikeras` 0.13 reports `estimator_type=None` from
-`__sklearn_tags__()` under scikit-learn 1.8, which makes `is_classifier()`
-return False and silently turns every classifier-only CV score into `nan`.
-`SklearnCompatKerasClassifier` patches the tag through — a genuine
-version-skew bug between the two libraries, not a misuse.)
+- **SMOTE oversampling: worse than doing nothing.** Applied correctly (via
+  `imblearn`'s pipeline, so the sampler only ever touches a fold's
+  training rows), it scored *below* the same model without it. That's the
+  honest counterpoint to several sources claiming big SMOTE wins on this
+  dataset — at least one of which has an acknowledged ambiguity about
+  applying it *before* the train/test split, which is a textbook leak.
+- **A wide class-weight sweep: also no help, and revealingly so.** Tried
+  `class_weight = {0:1, 1:w}` for every integer `w` from 1 to 30. Given
+  free choice across that whole range via cross-validated ROC-AUC, the
+  search settled on **`w=1` — no extra weighting at all**. Not just a
+  negative result: it says the threshold-tuning step already captures
+  whatever a reweighted loss would buy, so stacking a second
+  imbalance correction on top is redundant rather than additive.
+- **Feature-subset search (beam search, width 5, patience 10): didn't
+  generalize.** It found a 15-feature subset that beat the full set on
+  train-CV, but lost on every held-out test metric — including the one it
+  optimized. Classic overfitting to the search's own validation criterion
+  after scoring 1,500+ subsets against the same 5 folds.
+- **Ensembling: never decisively better.** Probability-averaging the top-3
+  and all-12 candidates was evaluated the same way as any single model.
+  It occasionally edged ahead by a hair, but never enough to justify
+  shipping and maintaining several models instead of one — the candidates
+  are mostly tree-based and highly correlated, so averaging cancels little
+  independent error.
+- **K-Means `customer_segment`: mixed, kept anyway.** It helped most
+  candidates modestly but hurt one, and net effect across the field is
+  close to a wash. Kept because it helps the deployed model specifically,
+  but flagged rather than dressed up as a clean win.
 
 ### A real bug this surfaced
 
@@ -235,14 +211,10 @@ the two can't drift apart again.
 
 ### Feature importance
 
-Full ranked list for the deployed model is written to
-`model/feature_importance.json` on every training run. CatBoost (both
-one-hot and native) exposes its own `feature_importances_`, so this uses
-that directly rather than the permutation-importance fallback (which
-kicks in only for candidates like HistGradientBoosting/MLP that expose
-neither `feature_importances_` nor `coef_` — see `extract_feature_importance`
-in `train/train.py`). Since native mode doesn't one-hot encode, this is
-importance per raw column, not per category level. Top 5:
+Full ranked list is written to `model/feature_importance.json` on every
+training run, taken from CatBoost's own `feature_importances_`. Because
+native mode doesn't one-hot encode, these are importances per *raw
+column*, not per category level. Top 5:
 
 | Feature | Importance |
 |---|---|
@@ -276,44 +248,34 @@ applied to this dataset throughout — segment analysis, permutation
 importance, the paper's own SHAP results — all agree these two features
 (plus tenure) carry most of the real signal.
 
-### What moved the numbers, and what didn't
+### Where the ceiling actually is
 
-Started from a hypothesis-driven diagnosis (see `model/metrics.json` history
-in git log for the "untuned" and "5-model, no fixes" baselines): feature
-importances showed 23 of 52 one-hot columns carrying a combined 4.3% of
-total importance (mostly the redundant `"No internet service"` duplicates),
-and slicing customers by their strongest predictors showed several
-sizeable segments with near-50% churn rates *within* customers who are
-identical on every available feature — i.e. some of the gap is inherent to
-the dataset, not fixable by tuning.
+Cumulatively, the work above moved churn F1 from **0.623** (an untuned
+baseline) to **0.636**, and accuracy from 0.751 to 0.779. Real, but modest
+— and the reason it's modest is worth stating plainly, because it's the
+most useful finding in this project.
 
-After collapsing the redundant categories, adding `charges_delta` /
-`is_new_customer`, widening the regularization search, and adding
-ensembling:
+Three independent lines of evidence say the limit is the *data*, not the
+modeling:
 
-- **Churn F1 improved consistently across every candidate** (e.g. LightGBM
-  0.623 → 0.632, Gradient Boosting 0.620 → 0.630, Random Forest
-  0.617 → 0.626) — a real, reproducible ~1-point gain, not noise from a
-  single lucky split.
-- **`charges_delta` earned its place**: it's the 3rd most important feature
-  in the final model (`num__tenure` and `num__MonthlyCharges` are 1st/2nd),
-  ahead of `TotalCharges` itself.
-- **The train/test ROC-AUC gap did not close** (0.0297 → 0.0317, i.e. no
-  meaningful change) despite adding L1/L2 regularization search — evidence
-  this was never really an overfitting problem, reinforcing that the
-  remaining ~15 points of ROC-AUC headroom is the dataset's actual
-  information ceiling, not solvable by better regularization.
-- **Ensembling didn't beat the best single model** (0.630 vs. LightGBM's
-  0.632) — the candidates are all gradient/tree-based and highly
-  correlated, so averaging them doesn't cancel out much independent error.
+1. **Twelve different algorithms converge to within ~2 points** of each
+   other on balanced accuracy. When a linear model and a tuned gradient
+   booster land in the same place, the bottleneck isn't model capacity.
+2. **The train/test ROC-AUC gap never closed** (~0.03) despite explicit
+   L1/L2 regularization search — so this was never primarily an
+   overfitting problem that better regularization could fix.
+3. **Segment analysis finds irreducible overlap.** Slicing month-to-month
+   customers by tenure bucket × internet service × charge quartile — the
+   four strongest predictors together — leaves ~10 sizeable segments with
+   churn rates between 30% and 70%. Customers *identical on every
+   available feature* still split near a coin flip. No model can separate
+   what the features don't distinguish.
 
-Net: real, honest improvement (~1 point of F1, ~2 points of accuracy),
-consistent across the board — and further confirmation that we're now
-close to what these 19 raw features can support. The next real gain would
-come from new data (support tickets, usage patterns, competitor pricing
-signals), not more modeling.
+Further gains would need information this schema doesn't contain —
+support-ticket history, usage trends, competitor pricing, whether a
+retention offer was made — not more algorithms or tuning.
 
-### How this compares to published results (and adding CatBoost)
+### How this compares to published results
 
 Checked this against outside work on the same dataset rather than just
 trusting our own numbers in isolation. Two findings:
@@ -338,98 +300,28 @@ trusting our own numbers in isolation. Two findings:
   dataset are unfortunately more often a warning sign than a technique to
   copy — not something to chase.
 
-Given the matching paper's model choice, first **added CatBoost** through
-the same one-hot pipeline as everything else — it landed weakest of all
-six candidates at the time (0.622 test F1), not an improvement.
+Reading the matching paper's *full methodology* rather than just its
+headline numbers surfaced two techniques worth borrowing, both since
+adopted and both verified in isolation on the untouched test set:
 
-Digging into the paper's full methodology (not just its headline numbers)
-surfaced two more specific techniques it credited that we hadn't tried:
-CatBoost's **native categorical handling** (`cat_features`, no one-hot at
-all) and **`scale_pos_weight` search** (tried at `1.0`, `sqrt(ratio)`, and
-the raw imbalance ratio) for every boosting model, not just relying on
-threshold tuning. Implemented both, plus a few of the paper's own
-domain-engineered features (`high_risk_new_customer`, `has_streaming`,
-`manual_payment`, `discount_ratio`). Honest results, each verified on the
-untouched test set:
+- **CatBoost's native categorical handling was a real, isolated win.**
+  Same search space, same features, same everything else — one-hot CatBoost
+  scored 0.625 test F1, native CatBoost **0.630**. This confirmed the
+  paper's specific mechanistic claim rather than just its bottom line, and
+  it's why the deployed model uses `cat_features` today.
+- **A few of its domain-engineered features carried over** —
+  `high_risk_new_customer`, `has_streaming`, `manual_payment`,
+  `discount_ratio` — and the K-Means segmentation idea became
+  `CustomerSegmentFeature`.
 
-- **Native categorical handling for CatBoost was a real, isolated win**:
-  same search space, same everything else — one-hot CatBoost scored 0.625
-  test F1, native CatBoost scored **0.630**. This directly confirms the
-  paper's specific claim, not just its headline number.
-- **`scale_pos_weight` search was a wash for some models and a regression
-  for one**: LightGBM's test F1 actually *dropped* (0.632 → 0.627) after
-  adding it as an 8th tuned dimension to `RandomizedSearchCV` — with the
-  same 20-iteration search budget, one more dimension means less effective
-  coverage of the parameters that mattered before. A lesson in its own
-  right: widening a hyperparameter search without widening its budget can
-  quietly make individual candidates worse, even when it helps others.
-- **The combination made ensembling finally pay off**: previously,
-  ensembling never beat the best single model. With native CatBoost now in
-  the mix, `Ensemble (top 3)` — CatBoost (one-hot) + XGBoost + Random
-  Forest — edges out every individual candidate: test F1 0.632 (vs. the
-  prior deployment's 0.6316 — a marginal but real gain, not tied) and test
-  accuracy 0.782 (vs. 0.761, a more solid +2 points). ROC-AUC is flat.
-
-Net: modest, not dramatic — consistent with the ceiling already being
-close. But real, verified, multi-metric-consistent, and it came from
-specific, attributable techniques rather than "try more stuff and see."
-(This round's deployed model, `Ensemble (top 3)`, was later superseded —
-see below.) Along the way, hit and fixed *two* separate CatBoost/scikit-learn
-interop bugs: `l2_leaf_reg` and `cat_features` both fail sklearn's `clone()`
-equality check when passed as constructor arguments — `l2_leaf_reg` fixed
-by casting to native Python floats, `cat_features` fixed by passing it
-through `.fit()` instead of the constructor, since
-`RandomizedSearchCV`/`cross_val_predict` support per-step fit params via
-the `model__cat_features=...` prefix convention.
-
-### Trying more model families
-
-Rounded out the model comparison with three more families through the same
-search/CV/threshold-tuning pipeline: `ExtraTreesClassifier` (Random
-Forest's more-randomized sibling), `HistGradientBoostingClassifier`
-(scikit-learn's own histogram-based boosting — the same algorithmic family
-as LightGBM, independently implemented, not yet tried), and a small
-`MLPClassifier` (mainly to answer "did you try a neural net" definitively).
-
-- **HistGradientBoostingClassifier won outright** — test F1 **0.638**,
-  beating every other individual model *and* both ensembles, despite having
-  the lowest CV ROC-AUC (0.848) among the strong contenders. It found a
-  precision/recall trade-off at its tuned threshold that nothing else
-  reached. Concretely: ROC-AUC measures ranking quality across all possible
-  thresholds; F1 measures performance at one specific threshold, which is
-  what's actually deployed — the two don't have to agree on which model is
-  "best," and here they didn't.
-- **Extra Trees landed right next to Random Forest** (0.622 vs. 0.623 F1)
-  — expected, they're closely related algorithms; no real signal either
-  way.
-- **The MLP clearly underperformed** (0.606 F1, worst of all ten
-  candidates) — expected on ~5.6k training rows of tabular data, and now
-  actually confirmed rather than assumed. Not worth pursuing further (e.g.
-  architecture tuning) given the gap.
-- **Fixed a real gap this surfaced**: `HistGradientBoostingClassifier` has
-  neither `feature_importances_` nor `coef_`, so `feature_importance.json`
-  was silently going stale (still describing whichever model won
-  *previously*) the first time this ran. Fixed with a permutation-importance
-  fallback (`sklearn.inspection.permutation_importance` on the held-out
-  test set, post-hoc only — doesn't affect model selection) for any
-  candidate lacking a native importance measure.
-
-The deployed model is now `HistGradientBoostingClassifier` alone — F1 0.638
-is the best result of the whole project, and it came from trying one more
-legitimately different algorithm family rather than further tuning the ones
-already tried.
-
-A forward beam search over feature subsets (width 5, patience 10, scored
-by cross-validated balanced accuracy on the training split) was also
-tried. It found a 15-feature subset that scored better on train-CV than
-the full feature set, but the improvement didn't hold up on the held-out
-test set — the full feature set won on every test metric, including the
-one the search optimized for. Classic overfitting to the search's own
-validation criterion (scoring 1,500+ candidate subsets against the same 5
-CV folds inflates the eventual "winner" via multiple-comparisons luck).
-Not adopted, and the tool has since been removed from the repo — it did
-its job as a diagnostic, and there's no reason to keep unused code around
-once the answer's in.
+Two CatBoost/scikit-learn interop bugs turned up along the way, both worth
+knowing about if you extend this: `l2_leaf_reg` and `cat_features` each
+fail sklearn's `clone()` equality check when passed as constructor
+arguments (and `RandomizedSearchCV` clones per fold). `l2_leaf_reg` is
+fixed by casting the search grid to native Python floats instead of
+`numpy.float64`; `cat_features` is fixed by passing it through `.fit()`
+via the `model__cat_features=...` fit-param convention, sidestepping
+`clone()` entirely.
 
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
 the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
@@ -444,9 +336,8 @@ source .venv/Scripts/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
 # Train the model (writes model/churn_model.joblib, decision_threshold.json,
-# metrics.json, feature_schema.json). Runs a hyperparameter search across
-# 12 model families with 5-fold CV, so it takes ~6min (the Keras ANN
-# candidate accounts for roughly half of that on its own).
+# metrics.json, feature_importance.json, feature_schema.json). Runs a
+# 20-iteration hyperparameter search with 5-fold CV, so it takes ~2min.
 python train/train.py
 
 # Run the tests

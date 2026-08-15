@@ -1,16 +1,23 @@
-"""Train a churn-prediction model on the Telco Customer Churn dataset.
+"""Train the churn-prediction model on the Telco Customer Churn dataset.
 
-For each candidate model family:
-  1. Hyperparameter-search on the training split (5-fold CV, scored on
-     ROC-AUC, which is threshold-independent).
-  2. Pick a decision threshold by sweeping F1 on the "Churn" class using
-     out-of-fold predictions on the training split (cross_val_predict) —
+The model is CatBoost using its native categorical handling — it consumes
+the raw category strings directly via `cat_features`, with no one-hot
+encoding step at all. It was picked after comparing twelve model families
+(tree ensembles, boosting libraries, a linear baseline, and two neural
+nets) under this same CV/threshold-tuning protocol; it won on both churn
+F1 and balanced accuracy. That comparison lives in git history rather than
+here — see README for the results table and the reasoning.
+
+Pipeline:
+  1. Hyperparameter search on the training split (5-fold stratified CV,
+     scored on ROC-AUC, which is threshold-independent).
+  2. Pick a decision threshold by sweeping F1 on the "Churn" class over
+     out-of-fold predictions on the *training* split (cross_val_predict) —
      this never looks at the test set, so the threshold isn't overfit to it.
-  3. Evaluate the tuned model + tuned threshold once on the held-out test
-     split, and keep whichever candidate has the best test-set churn F1.
+  3. Evaluate once on the held-out test split.
 
-Saves the winning pipeline, its decision threshold, per-candidate metrics,
-and a feature schema (for the API/UI) under ./model/.
+Saves the fitted pipeline, its decision threshold, metrics, feature
+importances, and a feature schema (for the API/UI) under ./model/.
 
 Usage:
     python train/train.py
@@ -18,31 +25,20 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
-
-# Quiet TensorFlow's C++ logging before it's imported (the ANN candidate);
-# otherwise every CV fold prints oneDNN/absl banners over the results.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import joblib
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-from lightgbm import LGBMClassifier
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import (
-    ExtraTreesClassifier,
-    GradientBoostingClassifier,
-    HistGradientBoostingClassifier,
-    RandomForestClassifier,
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    f1_score,
+    roc_auc_score,
 )
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
-from xgboost import XGBClassifier
-from sklearn.inspection import permutation_importance
-from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_auc_score
 from sklearn.model_selection import (
     RandomizedSearchCV,
     StratifiedKFold,
@@ -50,8 +46,6 @@ from sklearn.model_selection import (
     train_test_split,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from scikeras.wrappers import KerasClassifier
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # so `python train/train.py` can `import app.*`
@@ -59,9 +53,7 @@ sys.path.insert(0, str(ROOT))  # so `python train/train.py` can `import app.*`
 from app.features import (  # noqa: E402
     CATEGORICAL_FEATURES,
     ENGINEERED_CATEGORICAL,
-    ENGINEERED_NUMERIC,
     NUMERIC_FEATURES,
-    AverageProbabilityEnsemble,
     CustomerSegmentFeature,
     FeatureEngineer,
 )
@@ -76,62 +68,20 @@ IMPORTANCE_PATH = MODEL_DIR / "feature_importance.json"
 
 TARGET = "Churn"
 
-# For CatBoost's native categorical handling (no one-hot encoding at all —
-# it consumes raw category strings directly).
+# Columns CatBoost should treat as categorical (raw strings, not encoded).
 NATIVE_CATEGORICAL_COLUMNS = CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL
+
+# cat_features is passed at fit() time rather than on the constructor:
+# as a constructor arg it hits a real CatBoost/sklearn interop bug, where
+# CatBoost's get_params() doesn't round-trip the list in a way that
+# satisfies sklearn's clone() equality check — and RandomizedSearchCV
+# clones the pipeline per fold/candidate. Passing it via fit() sidesteps
+# clone() entirely.
+FIT_PARAMS = {"model__cat_features": NATIVE_CATEGORICAL_COLUMNS}
 
 RANDOM_STATE = 42
 CV_FOLDS = 5
 SEARCH_ITER = 20
-
-# Positive-class weight sweep for the "weighted" imbalance-handling
-# candidate (replaces an earlier SMOTE variant — cross-validated the same
-# way, weight chosen by hyperparameter search rather than a fixed ratio).
-CLASS_WEIGHT_SWEEP = [{0: 1, 1: w} for w in range(1, 31)]
-
-
-class SklearnCompatKerasClassifier(KerasClassifier):
-    """scikeras 0.13's KerasClassifier reports `estimator_type=None` from
-    `__sklearn_tags__()` under scikit-learn 1.8, so `is_classifier()`
-    returns False and every classifier-only scorer (roc_auc, f1, ...)
-    silently yields nan instead of a score. It still sets the legacy
-    `_estimator_type = "classifier"` attribute, which is what earlier
-    sklearn versions read — so this is a version-skew bug between the two
-    libraries, not a misuse. Patch the tag through so CV scoring works."""
-
-    def __sklearn_tags__(self):
-        tags = super().__sklearn_tags__()
-        tags.estimator_type = "classifier"
-        return tags
-
-
-def build_ann(hidden_layers=(64, 32), dropout=0.3, meta=None):
-    """Keras feed-forward net for the ANN candidate.
-
-    Deeper/more configurable than the sklearn MLPClassifier candidate
-    (which is a single dense stack with no dropout or batch norm), so the
-    two aren't redundant: this one tests whether a *properly built* net
-    with regularization does better on this tabular data, rather than
-    leaving that assumed from the simple MLP's poor showing.
-
-    scikeras passes `meta` with the fitted data's shape, so the input
-    layer adapts to however many columns one-hot encoding produced.
-    """
-    from tensorflow import keras
-
-    n_features = meta["n_features_in_"]
-    model = keras.Sequential([keras.layers.Input(shape=(n_features,))])
-    for units in hidden_layers:
-        model.add(keras.layers.Dense(units, activation="relu"))
-        model.add(keras.layers.BatchNormalization())
-        model.add(keras.layers.Dropout(dropout))
-    model.add(keras.layers.Dense(1, activation="sigmoid"))
-    model.compile(
-        loss="binary_crossentropy",
-        optimizer=keras.optimizers.Adam(),
-        metrics=["accuracy"],
-    )
-    return model
 
 
 def load_data() -> pd.DataFrame:
@@ -145,258 +95,37 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-def build_preprocessor() -> ColumnTransformer:
-    # Dense output + pandas column names throughout (rather than the
-    # default sparse/ndarray output) so the same column-labeled frame shape
-    # flows through fit *and* predict for every candidate — LightGBM's
-    # sklearn wrapper otherwise warns loudly about feature-name mismatches
-    # between training (array with generated names) and serving (a plain
-    # array with none). Dataset is small enough (~55 columns after
-    # one-hot encoding) that dense is a non-issue memory-wise.
-    ct = ColumnTransformer(
-        transformers=[
+def build_pipeline() -> Pipeline:
+    """Feature engineering, then K-Means segmentation, then the classifier.
+
+    No ColumnTransformer/one-hot step — CatBoost consumes the raw
+    categorical strings directly (see FIT_PARAMS).
+    """
+    return Pipeline(
+        steps=[
+            ("engineer", FeatureEngineer()),
+            ("segment", CustomerSegmentFeature(random_state=RANDOM_STATE)),
             (
-                "cat",
-                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL,
+                "model",
+                CatBoostClassifier(
+                    random_state=RANDOM_STATE, verbose=False, thread_count=1
+                ),
             ),
-            ("num", StandardScaler(), NUMERIC_FEATURES + ENGINEERED_NUMERIC),
-        ]
-    )
-    return ct.set_output(transform="pandas")
-
-
-def build_pipeline(estimator) -> Pipeline:
-    return Pipeline(
-        steps=[
-            ("engineer", FeatureEngineer()),
-            ("segment", CustomerSegmentFeature(random_state=RANDOM_STATE)),
-            ("preprocess", build_preprocessor()),
-            ("model", estimator),
         ]
     )
 
 
-def build_native_categorical_pipeline(estimator) -> Pipeline:
-    """No ColumnTransformer/one-hot step at all — the estimator (CatBoost,
-    with cat_features set) consumes FeatureEngineer's raw+engineered
-    DataFrame directly."""
-    return Pipeline(
-        steps=[
-            ("engineer", FeatureEngineer()),
-            ("segment", CustomerSegmentFeature(random_state=RANDOM_STATE)),
-            ("model", estimator),
-        ]
-    )
-
-
-
-
-def search_spaces(scale_pos_weight_options: list[float]) -> dict:
+def search_space(scale_pos_weight_options: list[float]) -> dict:
     return {
-        "logistic_regression": (
-            LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE),
-            {"model__C": np.logspace(-3, 2, 30)},
-        ),
-        "random_forest": (
-            RandomForestClassifier(class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1),
-            {
-                "model__n_estimators": [200, 300, 400],
-                "model__max_depth": [4, 6, 8, 10, None],
-                "model__min_samples_leaf": [1, 2, 4, 8],
-                "model__min_samples_split": [2, 5, 10, 20],
-                "model__max_features": ["sqrt", "log2"],
-            },
-        ),
-        "extra_trees": (
-            # Random Forest's more-randomized sibling (splits chosen
-            # randomly rather than by best-gain search) — cheap to add,
-            # sometimes generalizes better than RF on noisy tabular data.
-            ExtraTreesClassifier(class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1),
-            {
-                "model__n_estimators": [200, 300, 400],
-                "model__max_depth": [4, 6, 8, 10, None],
-                "model__min_samples_leaf": [1, 2, 4, 8],
-                "model__min_samples_split": [2, 5, 10, 20],
-                "model__max_features": ["sqrt", "log2"],
-            },
-        ),
-        "hist_gradient_boosting": (
-            # scikit-learn's own histogram-based boosting (same family of
-            # algorithm as LightGBM, independently implemented) — hadn't
-            # been tried; unlike GradientBoostingClassifier it scales to
-            # this dataset's size the same way XGBoost/LightGBM do.
-            HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-            {
-                "model__max_iter": [100, 200, 300],
-                "model__max_depth": [None, 3, 5, 7],
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__l2_regularization": [float(x) for x in np.logspace(-3, 1, 10)],
-                "model__max_leaf_nodes": [15, 31, 63, 127],
-                "model__class_weight": [None, "balanced"],
-            },
-        ),
-        "hist_gradient_boosting_weighted": (
-            # Same model + search space as hist_gradient_boosting above,
-            # but with a wide positive-class weight sweep (1-30, see
-            # CLASS_WEIGHT_SWEEP) instead of SMOTE oversampling — an
-            # isolated, controlled test of whether weighting the loss
-            # function more aggressively than the narrow scale_pos_weight
-            # range used elsewhere (max ~2.76) does better than
-            # oversampling for class imbalance.
-            HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-            {
-                "model__max_iter": [100, 200, 300],
-                "model__max_depth": [None, 3, 5, 7],
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__l2_regularization": [float(x) for x in np.logspace(-3, 1, 10)],
-                "model__max_leaf_nodes": [15, 31, 63, 127],
-                "model__class_weight": CLASS_WEIGHT_SWEEP,
-            },
-        ),
-        "mlp": (
-            # A small neural net, mostly to answer "did you try deep
-            # learning" definitively rather than leave it assumed. Not
-            # expected to beat the tree ensembles on ~5.6k training rows
-            # of tabular data — worth confirming rather than assuming.
-            MLPClassifier(random_state=RANDOM_STATE, max_iter=500, early_stopping=True),
-            {
-                "model__hidden_layer_sizes": [(32,), (64,), (32, 16), (64, 32)],
-                "model__alpha": [float(x) for x in np.logspace(-4, 0, 10)],
-                "model__learning_rate_init": [0.001, 0.003, 0.01],
-            },
-        ),
-        "ann": (
-            # A proper Keras feed-forward net (batch norm + dropout,
-            # deeper options, class weighting) rather than the plain
-            # sklearn MLP above — so "neural nets don't help here" is
-            # tested against a real architecture, not just the simplest
-            # possible one.
-            SklearnCompatKerasClassifier(
-                model=build_ann,
-                loss="binary_crossentropy",
-                epochs=50,
-                batch_size=64,
-                verbose=0,
-                validation_split=0.15,
-                # scikeras requires model-builder kwargs to be declared on
-                # the constructor before they can be tuned via set_params
-                # (which is how RandomizedSearchCV varies them).
-                hidden_layers=(64, 32),
-                dropout=0.3,
-                random_state=RANDOM_STATE,
-            ),
-            {
-                "model__hidden_layers": [(32,), (64,), (64, 32), (128, 64), (128, 64, 32)],
-                "model__dropout": [0.1, 0.2, 0.3, 0.4],
-                "model__batch_size": [32, 64, 128],
-                "model__class_weight": [None, "balanced"],
-            },
-        ),
-        "gradient_boosting": (
-            GradientBoostingClassifier(random_state=RANDOM_STATE),
-            {
-                "model__n_estimators": [100, 150, 200],
-                "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
-                "model__max_depth": [2, 3, 4],
-                "model__subsample": [0.7, 0.85, 1.0],
-                "model__min_samples_leaf": [1, 5, 10, 20],
-            },
-        ),
-        "xgboost": (
-            XGBClassifier(
-                random_state=RANDOM_STATE,
-                n_jobs=1,
-                eval_metric="logloss",
-            ),
-            {
-                "model__n_estimators": [100, 200, 300],
-                "model__max_depth": [2, 3, 4, 5, 6],
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__subsample": [0.6, 0.8, 1.0],
-                "model__colsample_bytree": [0.6, 0.8, 1.0],
-                "model__min_child_weight": [1, 3, 5],
-                # L1/L2 regularization + min split-loss gain, to close the
-                # ~0.03 train/test ROC-AUC gap seen on the untuned range.
-                "model__reg_alpha": np.logspace(-3, 1, 10),
-                "model__reg_lambda": np.logspace(-3, 1, 10),
-                "model__gamma": [0, 0.1, 0.5, 1, 2],
-                # Class-weighting via scale_pos_weight, searched over 1.0
-                # (off), sqrt(imbalance ratio), and the raw ratio — mirrors
-                # what arXiv:2607.10260 did on this same dataset. Until now
-                # we only relied on threshold tuning for imbalance on the
-                # boosting models; this gives the search the option to
-                # weight the loss itself too.
-                "model__scale_pos_weight": scale_pos_weight_options,
-            },
-        ),
-        "lightgbm": (
-            LGBMClassifier(
-                random_state=RANDOM_STATE,
-                n_jobs=1,
-                subsample_freq=1,
-                verbosity=-1,
-            ),
-            {
-                "model__n_estimators": [100, 200, 300],
-                "model__num_leaves": [15, 31, 63, 127],
-                "model__max_depth": [-1, 3, 5, 7],
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__subsample": [0.6, 0.8, 1.0],
-                "model__colsample_bytree": [0.6, 0.8, 1.0],
-                "model__min_child_samples": [5, 10, 20, 30],
-                "model__reg_alpha": np.logspace(-3, 1, 10),
-                "model__reg_lambda": np.logspace(-3, 1, 10),
-                "model__scale_pos_weight": scale_pos_weight_options,
-            },
-        ),
-        "catboost": (
-            # A closely-matching independent benchmark on this exact
-            # dataset (same 5-fold CV + F1-threshold-tuning methodology)
-            # deployed CatBoost as its final model, so it's worth having
-            # in the comparison rather than assuming the four boosters
-            # already tried cover the space.
-            CatBoostClassifier(random_state=RANDOM_STATE, verbose=False, thread_count=1),
-            {
-                "model__iterations": [100, 200, 300],
-                "model__depth": [3, 4, 5, 6, 7],
-                # Native Python floats, not numpy.float64: CatBoost's
-                # get_params()/constructor round-trip doesn't preserve
-                # numpy scalar dtype, which fails sklearn's clone() check
-                # (RandomizedSearchCV clones the pipeline per fold/candidate).
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
-                "model__scale_pos_weight": scale_pos_weight_options,
-            },
-        ),
-        "catboost_native": (
-            # Same search space as "catboost" above, but fed raw category
-            # strings via cat_features instead of one-hot columns — the
-            # independent benchmark specifically credited this (plus
-            # ordered boosting) for CatBoost's result, so it's worth
-            # isolating from the one-hot version to see what it actually
-            # buys on its own.
-            #
-            # cat_features is passed at fit() time (see NATIVE_FIT_PARAMS),
-            # not the constructor: passing it as a constructor arg hits a
-            # real CatBoost/sklearn interop bug — CatBoost's get_params()
-            # doesn't round-trip a cat_features list in a way that
-            # satisfies sklearn's clone() equality check (the same class of
-            # issue as the l2_leaf_reg numpy-dtype bug above, different
-            # parameter). Passing it via fit() sidesteps clone() entirely.
-            CatBoostClassifier(random_state=RANDOM_STATE, verbose=False, thread_count=1),
-            {
-                "model__iterations": [100, 200, 300],
-                "model__depth": [3, 4, 5, 6, 7],
-                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-                "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
-                "model__scale_pos_weight": scale_pos_weight_options,
-            },
-        ),
+        "model__iterations": [100, 200, 300],
+        "model__depth": [3, 4, 5, 6, 7],
+        "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+        # Native Python floats, not numpy.float64: CatBoost's
+        # get_params()/constructor round-trip doesn't preserve numpy scalar
+        # dtype, which fails sklearn's clone() check.
+        "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
+        "model__scale_pos_weight": scale_pos_weight_options,
     }
-
-
-NATIVE_FIT_PARAMS = {"model__cat_features": NATIVE_CATEGORICAL_COLUMNS}
 
 
 def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
@@ -409,74 +138,27 @@ def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
     return best_t, best_f1
 
 
-def extract_feature_importance(pipeline, X_val: pd.DataFrame, y_val: pd.Series) -> pd.Series | None:
-    """Feature importances (normalized to sum to 1) for the final model,
-    mapped back to real column names via the preprocessor. Handles a plain
-    Pipeline (tree models' feature_importances_, |coef_| for linear models,
-    or permutation importance as a fallback for models with neither — e.g.
-    HistGradientBoostingClassifier, MLPClassifier) and an
-    AverageProbabilityEnsemble (averages its members').
-
-    X_val/y_val (the held-out test split) are only used for the
-    permutation-importance fallback — a post-hoc explanation of the
-    already-selected, already-evaluated model, not a training or
-    selection decision, so this doesn't leak into anything."""
-
-    def single(p: Pipeline) -> pd.Series | None:
-        model = p.named_steps["model"]
-        if "preprocess" in p.named_steps:
-            names = p.named_steps["preprocess"].get_feature_names_out()
-        elif hasattr(model, "feature_names_"):
-            # No ColumnTransformer step (e.g. CatBoost with native
-            # categoricals) — the model itself remembers the raw column
-            # names it was fit on.
-            names = model.feature_names_
-        else:
-            return None
-
-        if hasattr(model, "feature_importances_"):
-            values = np.asarray(model.feature_importances_, dtype=float)
-        elif hasattr(model, "coef_"):
-            values = np.abs(np.asarray(model.coef_[0], dtype=float))
-        else:
-            transformed_val = p[:-1].transform(X_val)
-            result = permutation_importance(
-                model, transformed_val, y_val,
-                n_repeats=10, random_state=RANDOM_STATE, scoring="roc_auc", n_jobs=-1,
-            )
-            # A shuffled feature can score *better* than intact by chance;
-            # clip those to 0 rather than let noise show up as "negative
-            # importance".
-            values = np.clip(result.importances_mean, 0, None)
-
-        if values.sum() > 0:
-            values = values / values.sum()
-        return pd.Series(values, index=names)
-
-    if isinstance(pipeline, AverageProbabilityEnsemble):
-        members = [single(p) for p in pipeline.fitted_pipelines]
-        members = [m for m in members if m is not None]
-        if not members:
-            return None
-        combined = pd.concat(members, axis=1).mean(axis=1)
-    else:
-        combined = single(pipeline)
-        if combined is None:
-            return None
-
-    return combined.sort_values(ascending=False)
-
-
 def evaluate_at_threshold(y_true, y_proba, threshold: float) -> dict:
     preds = (y_proba >= threshold).astype(int)
     return {
         "accuracy": accuracy_score(y_true, preds),
+        "balanced_accuracy": balanced_accuracy_score(y_true, preds),
         "f1": f1_score(y_true, preds),
         "roc_auc": roc_auc_score(y_true, y_proba),
         "classification_report": classification_report(
             y_true, preds, target_names=["No Churn", "Churn"], output_dict=True
         ),
     }
+
+
+def extract_feature_importance(pipeline: Pipeline) -> pd.Series:
+    """CatBoost's own feature importances, normalized to sum to 1 and
+    labelled with the column names it was fit on."""
+    model = pipeline.named_steps["model"]
+    values = np.asarray(model.feature_importances_, dtype=float)
+    if values.sum() > 0:
+        values = values / values.sum()
+    return pd.Series(values, index=model.feature_names_).sort_values(ascending=False)
 
 
 def main() -> None:
@@ -494,135 +176,76 @@ def main() -> None:
 
     ratio = float((y_train == 0).sum() / (y_train == 1).sum())
     scale_pos_weight_options = [1.0, float(np.sqrt(ratio)), ratio]
-    print(f"Class imbalance ratio (neg/pos) on train: {ratio:.3f}  "
-          f"scale_pos_weight options: {[round(v, 3) for v in scale_pos_weight_options]}")
+    print(
+        f"Class imbalance ratio (neg/pos) on train: {ratio:.3f}  "
+        f"scale_pos_weight options: {[round(v, 3) for v in scale_pos_weight_options]}"
+    )
 
-    candidates = search_spaces(scale_pos_weight_options)
-    ensemble_combos = {"ensemble_top3": 3, "ensemble_all": len(candidates)}
+    search = RandomizedSearchCV(
+        build_pipeline(),
+        param_distributions=search_space(scale_pos_weight_options),
+        n_iter=SEARCH_ITER,
+        scoring="roc_auc",
+        cv=cv,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        refit=True,
+    )
+    search.fit(X_train, y_train, **FIT_PARAMS)
+    pipeline = search.best_estimator_
+    cv_std = float(search.cv_results_["std_test_score"][search.best_index_])
 
-    results = {}
-    fitted = {}  # name -> {pipeline, oof_proba, test_proba, cv_roc_auc_mean}
-    candidate_pipelines = {}  # name -> object with .predict_proba(X), for saving
+    # Out-of-fold probabilities on the *training* split, using the tuned
+    # hyperparameters, so the threshold is picked without ever touching the
+    # held-out test set.
+    oof_proba = cross_val_predict(
+        pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1,
+        params=FIT_PARAMS,
+    )[:, 1]
+    threshold, oof_f1 = best_threshold_for_f1(y_train, oof_proba)
 
-    for name, (estimator, param_dist) in candidates.items():
-        is_native = name == "catboost_native"
-        pipeline = build_native_categorical_pipeline(estimator) if is_native else build_pipeline(estimator)
-        fit_params = NATIVE_FIT_PARAMS if is_native else {}
-
-        search = RandomizedSearchCV(
-            pipeline,
-            param_distributions=param_dist,
-            n_iter=SEARCH_ITER,
-            scoring="roc_auc",
-            cv=cv,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            refit=True,
-        )
-        search.fit(X_train, y_train, **fit_params)
-        tuned_pipeline = search.best_estimator_
-        cv_std = float(search.cv_results_["std_test_score"][search.best_index_])
-
-        # Out-of-fold probabilities on the *training* split, using the
-        # tuned hyperparameters, so the threshold is picked without ever
-        # touching the held-out test set.
-        oof_proba = cross_val_predict(
-            tuned_pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1,
-            params=fit_params,
-        )[:, 1]
-        threshold, oof_f1 = best_threshold_for_f1(y_train, oof_proba)
-
-        test_proba = tuned_pipeline.predict_proba(X_test)[:, 1]
-        test_metrics = evaluate_at_threshold(y_test, test_proba, threshold)
-
-        results[name] = {
-            "best_params": search.best_params_,
-            "cv_roc_auc_mean": float(search.best_score_),
-            "cv_roc_auc_std": cv_std,
-            "tuned_decision_threshold": threshold,
-            "oof_train_f1_at_threshold": oof_f1,
-            "test_metrics": test_metrics,
-        }
-        fitted[name] = {
-            "oof_proba": oof_proba,
-            "test_proba": test_proba,
-            "cv_roc_auc_mean": float(search.best_score_),
-        }
-        candidate_pipelines[name] = tuned_pipeline
-
-        print(
-            f"{name}: cv_roc_auc={search.best_score_:.3f} (+/-{cv_std:.3f})  "
-            f"threshold={threshold:.2f}  "
-            f"test_f1={test_metrics['f1']:.3f}  test_roc_auc={test_metrics['roc_auc']:.3f}  "
-            f"test_acc={test_metrics['accuracy']:.3f}"
-        )
-
-    # Probability-average ensembles of the top-K individual models by CV
-    # ROC-AUC. A simple average blend often generalizes slightly better
-    # than any single model once individual candidates have converged to
-    # similar performance, by cancelling out some of each model's
-    # uncorrelated errors.
-    ranked = sorted(fitted, key=lambda n: fitted[n]["cv_roc_auc_mean"], reverse=True)
-    for ensemble_name, k in ensemble_combos.items():
-        members = ranked[:k]
-        oof_avg = np.mean([fitted[m]["oof_proba"] for m in members], axis=0)
-        threshold, oof_f1 = best_threshold_for_f1(y_train, oof_avg)
-        test_avg = np.mean([fitted[m]["test_proba"] for m in members], axis=0)
-        test_metrics = evaluate_at_threshold(y_test, test_avg, threshold)
-
-        results[ensemble_name] = {
-            "members": members,
-            "tuned_decision_threshold": threshold,
-            "oof_train_f1_at_threshold": oof_f1,
-            "test_metrics": test_metrics,
-        }
-        candidate_pipelines[ensemble_name] = AverageProbabilityEnsemble(
-            [candidate_pipelines[m] for m in members]
-        )
-
-        print(
-            f"{ensemble_name} ({'+'.join(members)}): "
-            f"threshold={threshold:.2f}  "
-            f"test_f1={test_metrics['f1']:.3f}  test_roc_auc={test_metrics['roc_auc']:.3f}  "
-            f"test_acc={test_metrics['accuracy']:.3f}"
-        )
-
-    best_name = max(results, key=lambda n: results[n]["test_metrics"]["f1"])
-    best_pipeline = candidate_pipelines[best_name]
-    best_threshold = results[best_name]["tuned_decision_threshold"]
-    best_test_f1 = results[best_name]["test_metrics"]["f1"]
+    test_proba = pipeline.predict_proba(X_test)[:, 1]
+    test_metrics = evaluate_at_threshold(y_test, test_proba, threshold)
 
     print(
-        f"\nSelected best model: {best_name} "
-        f"(test churn f1={best_test_f1:.3f}, threshold={best_threshold:.2f})"
+        f"\nCV ROC-AUC: {search.best_score_:.4f} (+/-{cv_std:.4f})\n"
+        f"Tuned decision threshold: {threshold:.2f} "
+        f"(out-of-fold train F1 {oof_f1:.4f})\n"
+        f"Test: f1={test_metrics['f1']:.4f}  "
+        f"balanced_acc={test_metrics['balanced_accuracy']:.4f}  "
+        f"acc={test_metrics['accuracy']:.4f}  "
+        f"roc_auc={test_metrics['roc_auc']:.4f}"
     )
+    print(f"Best params: {search.best_params_}")
 
-    joblib.dump(best_pipeline, MODEL_PATH)
-    THRESHOLD_PATH.write_text(json.dumps({"threshold": best_threshold}, indent=2))
+    joblib.dump(pipeline, MODEL_PATH)
+    THRESHOLD_PATH.write_text(json.dumps({"threshold": threshold}, indent=2))
     METRICS_PATH.write_text(
-        json.dumps({"selected_model": best_name, "candidates": results}, indent=2)
+        json.dumps(
+            {
+                "model": "catboost_native",
+                "best_params": search.best_params_,
+                "cv_roc_auc_mean": float(search.best_score_),
+                "cv_roc_auc_std": cv_std,
+                "tuned_decision_threshold": threshold,
+                "oof_train_f1_at_threshold": oof_f1,
+                "test_metrics": test_metrics,
+            },
+            indent=2,
+        )
     )
 
-    importance = extract_feature_importance(best_pipeline, X_test, y_test)
-    if importance is not None:
-        IMPORTANCE_PATH.write_text(
-            json.dumps(
-                [
-                    {"feature": feat, "importance": round(float(val), 6)}
-                    for feat, val in importance.items()
-                ],
-                indent=2,
-            )
+    importance = extract_feature_importance(pipeline)
+    IMPORTANCE_PATH.write_text(
+        json.dumps(
+            [
+                {"feature": feat, "importance": round(float(val), 6)}
+                for feat, val in importance.items()
+            ],
+            indent=2,
         )
-        tail_n = min(10, len(importance))
-        dead_weight = importance[importance < 0.005]  # <0.5% of total importance each
-        print(f"\nTop 5 features: {list(importance.head(5).items())}")
-        print(f"Bottom {tail_n} features: {list(importance.tail(tail_n).items())}")
-        print(
-            f"Dead-weight features (<0.5% each): {len(dead_weight)} of {len(importance)}, "
-            f"combined {dead_weight.sum():.1%} of total importance"
-        )
-        print(f"Saved feature importance to {IMPORTANCE_PATH}")
+    )
+    print(f"\nTop 5 features: {list(importance.head(5).items())}")
 
     # Feature schema used to build the API's Pydantic model and the
     # Streamlit form: allowed categories per categorical column, and
@@ -643,9 +266,10 @@ def main() -> None:
     }
     SCHEMA_PATH.write_text(json.dumps(schema, indent=2))
 
-    print(f"Saved model to {MODEL_PATH}")
+    print(f"\nSaved model to {MODEL_PATH}")
     print(f"Saved decision threshold to {THRESHOLD_PATH}")
     print(f"Saved metrics to {METRICS_PATH}")
+    print(f"Saved feature importance to {IMPORTANCE_PATH}")
     print(f"Saved feature schema to {SCHEMA_PATH}")
 
 
