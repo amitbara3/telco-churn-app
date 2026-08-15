@@ -1,18 +1,27 @@
 FROM python:3.11-slim
 
-WORKDIR /code
-
-# curl is used by start.sh to wait for the API to come up.
+# curl is used by start.sh's readiness probe and by HEALTHCHECK below.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Run as a non-root user with a real, writable home directory. Hugging
+# Face Spaces runs Docker containers as UID 1000, and Streamlit needs a
+# writable HOME for its config/cache — as root-owned /root, it fails to
+# start there even though it works fine locally.
+RUN useradd --create-home --uid 1000 appuser
+USER appuser
+ENV HOME=/home/appuser \
+    PATH=/home/appuser/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+WORKDIR $HOME/app
 
-COPY app ./app
-COPY model ./model
-COPY start.sh .
-RUN chmod +x start.sh
+COPY --chown=appuser:appuser requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser model ./model
+COPY --chown=appuser:appuser start.sh .
 
 # Hugging Face Spaces (Docker SDK) routes traffic to this port.
 EXPOSE 7860
@@ -20,4 +29,9 @@ EXPOSE 7860
 # container / via `docker run -p 8000:8000 ...` if you want to hit it directly.
 EXPOSE 8000
 
-CMD ["./start.sh"]
+# Probes the API rather than the UI: Streamlit serving a page while the
+# backend is down is exactly the failure this should catch.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -sf http://localhost:8000/health || exit 1
+
+CMD ["bash", "start.sh"]

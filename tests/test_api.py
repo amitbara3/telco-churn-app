@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -54,3 +55,31 @@ def test_predict_rejects_missing_field():
     del incomplete["tenure"]
     response = client.post("/predict", json=incomplete)
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("tenure", -1),
+        ("tenure", 1000),
+        ("MonthlyCharges", -1.0),
+        ("MonthlyCharges", 10_000.0),
+        ("TotalCharges", -1.0),
+        ("TotalCharges", 1_000_000.0),
+    ],
+)
+def test_predict_rejects_out_of_range_numbers(field, value):
+    """A tree model clamps rather than extrapolates, so an absurd input
+    returns a confident-looking number instead of failing. Reject at the
+    edge rather than answer a question the model can't actually answer."""
+    response = client.post("/predict", json={**SAMPLE_CUSTOMER, field: value})
+    assert response.status_code == 422
+
+
+def test_predict_accepts_brand_new_customer():
+    """tenure=0 with no charges yet is a real, valid customer state."""
+    response = client.post(
+        "/predict", json={**SAMPLE_CUSTOMER, "tenure": 0, "TotalCharges": 0.0}
+    )
+    assert response.status_code == 200
+    assert 0.0 <= response.json()["churn_probability"] <= 1.0

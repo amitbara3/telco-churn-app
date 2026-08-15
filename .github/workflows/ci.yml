@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+
+  docker:
+    name: Docker image builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole deployment target is a Docker image, so a Dockerfile that
+      # only builds "in theory" is the single biggest deploy risk. This job
+      # builds it and proves the running container actually answers before
+      # anything reaches Hugging Face Spaces.
+      - name: Build image
+        run: docker build -t telco-churn-app .
+
+      - name: Start container
+        run: |
+          docker run -d --name churn -p 7860:7860 -p 8000:8000 telco-churn-app
+          echo "Waiting for the API to become healthy..."
+          for _ in $(seq 1 90); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "API is up."
+              exit 0
+            fi
+            if ! docker ps --filter name=churn --filter status=running -q | grep -q .; then
+              echo "::error::Container exited during startup."
+              docker logs churn
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::API never became healthy."
+          docker logs churn
+          exit 1
+
+      - name: Prediction endpoint returns a usable result
+        run: |
+          response=$(curl -sf -X POST http://localhost:8000/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"gender":"Female","SeniorCitizen":0,"Partner":"Yes","Dependents":"No",
+                 "tenure":1,"PhoneService":"No","MultipleLines":"No phone service",
+                 "InternetService":"DSL","OnlineSecurity":"No","OnlineBackup":"Yes",
+                 "DeviceProtection":"No","TechSupport":"No","StreamingTV":"No",
+                 "StreamingMovies":"No","Contract":"Month-to-month","PaperlessBilling":"Yes",
+                 "PaymentMethod":"Electronic check","MonthlyCharges":29.85,"TotalCharges":29.85}')
+          echo "$response"
+          echo "$response" | grep -q churn_probability
+
+      - name: Streamlit UI is served
+        run: curl -sf -o /dev/null -w '%{http_code}\n' http://localhost:7860 | grep -q 200
+
+      - name: Container logs
+        if: always()
+        run: docker logs churn

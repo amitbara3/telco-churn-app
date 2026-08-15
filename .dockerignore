@@ -3,8 +3,17 @@ __pycache__/
 *.pyc
 .git/
 .gitignore
+.gitattributes
+.github/
 tests/
 data/
 train/
 .pytest_cache/
 README.md
+requirements-dev.txt
+catboost_info/
+
+# Training artifacts that nothing reads at serve time. churn_model.joblib,
+# decision_threshold.json and feature_schema.json are all still needed.
+model/metrics.json
+model/feature_importance.json

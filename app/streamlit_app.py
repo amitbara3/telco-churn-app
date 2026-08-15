@@ -5,14 +5,25 @@ running alongside it in the same container, and shows the prediction.
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 import requests
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent.parent
+# `streamlit run app/streamlit_app.py` puts the *script's* directory on
+# sys.path, not the project root, so `import app.schemas` isn't resolvable
+# by default. Add the root explicitly rather than rely on the working
+# directory happening to be right inside the container.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.schemas import MAX_MONTHLY_CHARGES, MAX_TOTAL_CHARGES  # noqa: E402
+
 SCHEMA_PATH = ROOT / "model" / "feature_schema.json"
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+# start.sh runs the API on $API_PORT; keep the two in sync by default.
+API_URL = os.environ.get("API_URL", f"http://localhost:{os.environ.get('API_PORT', '8000')}")
 
 st.set_page_config(page_title="Telco Churn Predictor", page_icon="📉", layout="centered")
 
@@ -64,11 +75,19 @@ def main() -> None:
             contract = st.selectbox("Contract", cat["Contract"])
             paperless_billing = st.selectbox("Paperless billing", cat["PaperlessBilling"])
             payment_method = st.selectbox("Payment method", cat["PaymentMethod"])
+            # Upper bounds mirror the API's validation limits, so the form
+            # can't submit something the endpoint will reject with a 422.
             monthly_charges = st.number_input(
-                "Monthly charges ($)", min_value=0.0, value=round(num["MonthlyCharges"]["mean"], 2)
+                "Monthly charges ($)",
+                min_value=0.0,
+                max_value=MAX_MONTHLY_CHARGES,
+                value=round(num["MonthlyCharges"]["mean"], 2),
             )
             total_charges = st.number_input(
-                "Total charges ($)", min_value=0.0, value=round(num["TotalCharges"]["mean"], 2)
+                "Total charges ($)",
+                min_value=0.0,
+                max_value=MAX_TOTAL_CHARGES,
+                value=round(num["TotalCharges"]["mean"], 2),
             )
 
         submitted = st.form_submit_button("Predict churn")

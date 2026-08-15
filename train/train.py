@@ -87,10 +87,23 @@ SEARCH_ITER = 20
 def load_data() -> pd.DataFrame:
     df = pd.read_csv(DATA_PATH)
     df = df.drop(columns=["customerID"])
-    # TotalCharges is stored as a string and has a handful of blank values
-    # for customers with tenure == 0; coerce and drop those rows.
+
+    # TotalCharges ships as a string column with 11 blank values. Every one
+    # of them is a tenure == 0 customer — they simply haven't been billed
+    # yet, so the true value is 0.0, not "missing". Imputing beats dropping
+    # on two counts: it keeps 11 real rows, and it means the training data
+    # spans tenure 0-72 exactly like the API's accepted input range. Drop
+    # them instead and the model never sees a brand-new customer, yet the
+    # endpoint still happily accepts one and extrapolates silently.
     df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
-    df = df.dropna(subset=["TotalCharges"]).reset_index(drop=True)
+    unbilled = df["TotalCharges"].isna()
+    if not (df.loc[unbilled, "tenure"] == 0).all():
+        raise ValueError(
+            "Blank TotalCharges found on a customer with tenure > 0 — the "
+            "'not billed yet' assumption behind imputing 0.0 no longer holds."
+        )
+    df["TotalCharges"] = df["TotalCharges"].fillna(0.0)
+
     df[TARGET] = df[TARGET].map({"Yes": 1, "No": 0})
     return df
 

@@ -58,7 +58,10 @@ model/
   feature_importance.json  Full ranked feature importances of the deployed model
   feature_schema.json    Allowed categories / numeric ranges, used by the UI
 tests/
-  test_api.py          API tests (pytest + FastAPI TestClient)
+  test_api.py          HTTP-layer tests (pytest + FastAPI TestClient)
+  test_pipeline.py     Model/pipeline tests, incl. train-vs-serve feature parity
+.github/workflows/
+  ci.yml               Tests, plus a real Docker build + container smoke test
 Dockerfile
 start.sh              Container entrypoint
 requirements.txt
@@ -78,15 +81,15 @@ training, tuning, or threshold selection):
 
 | Metric | Value |
 |---|---|
-| Churn F1 | **0.636** |
-| Balanced accuracy | **0.763** |
-| Accuracy | 0.779 |
-| ROC-AUC | 0.840 |
-| Churn recall | 0.727 |
-| Churn precision | 0.566 |
+| Churn F1 | **0.634** |
+| Balanced accuracy | **0.764** |
+| Accuracy | 0.770 |
+| ROC-AUC | 0.846 |
+| Churn recall | 0.751 |
+| Churn precision | 0.549 |
 
-In plain terms: of customers who actually churn, the model flags ~73%; of
-those it flags, ~57% actually churn. For a retention use case that's the
+In plain terms: of customers who actually churn, the model flags ~75%; of
+those it flags, ~55% actually churn. For a retention use case that's the
 right side of the trade — a missed churner costs more than a wasted
 retention offer.
 
@@ -122,7 +125,7 @@ How `train/train.py` gets there:
    out-of-fold probabilities on the *training* split only, it sweeps
    thresholds and picks the one maximizing F1 on the "Churn" class —
    without ever looking at the test set, so the threshold isn't overfit to
-   it. The tuned value lands at 0.47.
+   it. The tuned value lands at 0.44.
 
 ### The model comparison that led here
 
@@ -194,20 +197,57 @@ would otherwise reasonably ask "did you try…?" about.
   close to a wash. Kept because it helps the deployed model specifically,
   but flagged rather than dressed up as a clean win.
 
-### A real bug this surfaced
+### Bugs and gaps found by auditing the pipeline
 
-Adding CatBoost-native to the candidate set earlier had exposed something
-that had been silently latent: `app/model.py`'s hardcoded raw-feature
-column order didn't match `train.py`'s. One-hot pipelines never noticed —
-`ColumnTransformer` selects columns by name, so order is irrelevant — but
+**Column-order drift between training and serving.** `app/model.py` and
+`train.py` each kept their own hand-maintained copy of the raw feature
+order, and they diverged. One-hot pipelines never noticed —
+`ColumnTransformer` selects by name, so order is irrelevant — but
 CatBoost's native-categorical mode resolves `cat_features` to *positional*
-indices at fit time. A live request built its row in a different column
-order than training used, so a categorical string could silently land in
-a position CatBoost expected to be numeric, crashing `/predict` outright
-(caught by the test suite, not manually). Fixed at the root rather than by
-reordering one list to match the other: both `train.py` and `app/model.py`
-now import a single shared `RAW_FEATURE_ORDER` from `app/features.py`, so
-the two can't drift apart again.
+indices at fit time, so a live request could feed a category string into a
+slot the model expected to be numeric, crashing `/predict`. Fixed at the
+root: both now import a single shared `RAW_FEATURE_ORDER` from
+`app/features.py`. `tests/test_pipeline.py` now asserts train/serve
+feature parity so this class of drift fails in CI rather than production.
+
+**A train/serve domain mismatch hiding in the data cleaning.** The 11 rows
+with blank `TotalCharges` were being dropped. All 11 are `tenure == 0`
+customers — they simply hadn't been billed yet, so the true value is
+`0.0`, not missing. Dropping them meant the model never saw a brand-new
+customer, while the API happily accepted `tenure=0` and extrapolated
+silently. Now imputed to `0.0`, with an assertion that fails loudly if a
+future data refresh ever puts a blank on a `tenure > 0` row. Net effect on
+metrics was mixed and small (ROC-AUC +0.006, balanced accuracy +0.002, F1
+−0.002, accuracy −0.009 — and not a clean A/B, since 11 extra rows change
+the train/test split itself); the reason to do it is correctness, not the
+scoreboard.
+
+**Unbounded numeric inputs.** `MonthlyCharges` and `TotalCharges` had no
+upper bound and `tenure` allowed up to 100, against training ranges of
+18.25–118.75, 0–8684.80 and 0–72. A gradient-boosted tree doesn't
+extrapolate — it clamps to the nearest leaf — so `MonthlyCharges: 99999`
+returned a confident-looking 0.70 rather than an error. Bounds are now set
+with deliberate headroom above the observed range, and out-of-range input
+gets a 422 instead of a fabricated answer.
+
+**A container that could come up broken.** `start.sh` waited 30s for the
+API and then started the UI *regardless*. If the backend failed, the Space
+would look healthy while erroring on every prediction — silent degradation
+is harder to diagnose than a crash. It now aborts if the API dies or never
+becomes healthy, and the Dockerfile has a `HEALTHCHECK` that probes the
+API rather than the UI.
+
+**The Dockerfile ran as root.** Hugging Face Spaces runs Docker containers
+as UID 1000, and Streamlit needs a writable `HOME` for its config/cache —
+a root-owned `/root` works locally and fails there. Now builds and runs as
+a non-root `appuser` with a real home directory.
+
+**Nothing ever built the image.** The deployment target is a Docker image,
+but it had never been built once — no local Docker, no CI. That was the
+single largest deploy risk. `.github/workflows/ci.yml` now runs the test
+suite and, separately, builds the image, starts the container, and asserts
+that `/health`, `/predict` and the Streamlit UI all actually respond
+before anything reaches a Space.
 
 ### Feature importance
 
