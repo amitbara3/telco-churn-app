@@ -4,14 +4,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.model import load_pipeline, predict
+from app.model import load_pipeline, load_threshold, predict
 from app.schemas import CustomerFeatures, PredictionResponse
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load (and cache) the model once at startup instead of on first request.
+    # Load (and cache) the model + decision threshold once at startup
+    # instead of on first request.
     load_pipeline()
+    load_threshold()
     yield
 
 
