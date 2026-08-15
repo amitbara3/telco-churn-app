@@ -69,10 +69,11 @@ requirements.txt
 `train/train.py` builds a pipeline of three steps — feature engineering,
 preprocessing, and a classifier — for each of eleven model families
 (Logistic Regression, Random Forest, Extra Trees, Gradient Boosting,
-HistGradientBoosting (plain and with SMOTE), XGBoost, LightGBM, CatBoost
-with one-hot encoding, CatBoost with native categorical handling, a small
-MLP neural net), plus two probability-averaging ensembles of the top-3 and
-all-11, and keeps whichever generalizes best. Concretely, per candidate:
+HistGradientBoosting (plain and with a wide class-weight sweep), XGBoost,
+LightGBM, CatBoost with one-hot encoding, CatBoost with native categorical
+handling, a small MLP neural net), plus two probability-averaging
+ensembles of the top-3 and all-11, and keeps whichever generalizes best.
+Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): `num_addon_services`
@@ -105,14 +106,16 @@ all-11, and keeps whichever generalizes best. Concretely, per candidate:
    space — L1/L2 regularization for XGBoost/LightGBM/CatBoost, and
    `scale_pos_weight` searched over `[1.0, sqrt(imbalance ratio),
    imbalance ratio]` for every boosting model.
-4. **Class imbalance, the SMOTE alternative**: one HistGradientBoosting
-   variant uses SMOTE oversampling instead of class weighting, via
-   `imblearn.pipeline.Pipeline` — which applies the sampler only during
-   `.fit()` on that fold's training rows, never during `.transform()`/
-   `.predict()`, the leakage-safe way to combine SMOTE with CV. (Several
-   sources found while researching this claim big accuracy gains from
-   SMOTE on this exact dataset; at least one has an acknowledged ambiguity
-   about applying it *before* the train/test split, a classic leak.)
+4. **Class imbalance, a wide weight sweep**: one HistGradientBoosting
+   variant searches `class_weight` over `{0: 1, 1: w}` for every integer
+   `w` from 1 to 30 (`CLASS_WEIGHT_SWEEP`) — much wider than the narrow
+   `scale_pos_weight` range (max ~2.76) used elsewhere, cross-validated the
+   same way as every other hyperparameter. (An earlier version of this
+   tried SMOTE oversampling instead, via `imblearn.pipeline.Pipeline` so
+   the sampler only ever touches a fold's training rows — never leaking
+   into validation/test. It scored worse than doing nothing special for
+   imbalance, so it was replaced with this weight sweep rather than kept
+   as dead weight in the pipeline.)
 5. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
    for an imbalanced target (~27% churn). Using `cross_val_predict` to get
    out-of-fold probabilities on the *training* split only, it sweeps
@@ -134,7 +137,7 @@ model's best hyperparameters and CV scores):
 | Extra Trees | 0.849 | 0.55 | 0.759 | 0.622 | 0.837 |
 | Gradient Boosting | 0.850 | 0.33 | 0.765 | 0.624 | 0.839 |
 | HistGradientBoosting | 0.848 | 0.29 | 0.749 | 0.624 | 0.835 |
-| HistGradientBoosting + SMOTE | 0.847 | 0.44 | 0.760 | 0.619 | 0.834 |
+| HistGradientBoosting + weight sweep (1-30) | 0.846 | 0.30 | 0.754 | 0.622 | 0.838 |
 | XGBoost | 0.850 | 0.35 | 0.775 | 0.631 | 0.838 |
 | LightGBM | 0.849 | 0.47 | 0.774 | 0.633 | 0.837 |
 | CatBoost (one-hot) | 0.851 | 0.59 | 0.770 | 0.627 | 0.839 |
@@ -143,18 +146,26 @@ model's best hyperparameters and CV scores):
 | Ensemble, top 3 | — | 0.49 | 0.772 | 0.631 | 0.839 |
 | Ensemble, all 11 | — | 0.47 | 0.778 | 0.634 | 0.840 |
 
-### SMOTE and K-Means segmentation, tested honestly
+### Class imbalance and K-Means segmentation, tested honestly
 
 Both techniques came directly out of researching how other work approaches
 this dataset. Neither is a clean win — reported exactly as measured, not
 rounded up:
 
-- **SMOTE, done correctly, didn't help.** `HistGradientBoosting + SMOTE`
-  scored *worse* than plain `HistGradientBoosting` on the same search space
-  (test F1 0.619 vs. 0.624). This is the honest counterpoint to the
-  handful of sources claiming big wins from SMOTE on this dataset — when
-  applied without leakage, it's not the lever those sources suggest, at
-  least stacked on top of threshold tuning we already do.
+- **Neither SMOTE nor a wide weight sweep beat plain threshold tuning.**
+  SMOTE was tried first (correctly, via `imblearn`'s leakage-safe
+  pipeline) and scored *worse* than doing nothing special for imbalance
+  (test F1 0.619 vs. 0.624 for plain `HistGradientBoosting`) — the honest
+  counterpoint to several sources claiming big wins from SMOTE on this
+  dataset. Replaced with a much wider `class_weight` sweep (`{0:1, 1:w}`
+  for `w` in 1–30, vs. the narrow ~1–2.76 range used elsewhere) to see if
+  aggressive loss-reweighting fared better: also worse (0.622), and
+  tellingly, the hyperparameter search — free to pick any of the 30
+  weights via cross-validated ROC-AUC — settled on **`w=1`, i.e. no extra
+  weighting at all**. That's a clean signal, not just a negative result:
+  our existing threshold-tuning step already captures whatever a
+  reweighted loss function would buy here, so stacking another
+  imbalance-correction on top is redundant, not additive.
 - **K-Means `customer_segment` was a genuinely mixed result.** Added to
   *every* candidate's feature set (not just one), it improved most of them
   slightly (Logistic Regression 0.622→0.628, LightGBM 0.627→0.633, CatBoost

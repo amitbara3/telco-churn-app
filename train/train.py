@@ -25,8 +25,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
@@ -79,6 +77,11 @@ NATIVE_CATEGORICAL_COLUMNS = CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL
 RANDOM_STATE = 42
 CV_FOLDS = 5
 SEARCH_ITER = 20
+
+# Positive-class weight sweep for the "weighted" imbalance-handling
+# candidate (replaces an earlier SMOTE variant — cross-validated the same
+# way, weight chosen by hyperparameter search rather than a fixed ratio).
+CLASS_WEIGHT_SWEEP = [{0: 1, 1: w} for w in range(1, 31)]
 
 
 def load_data() -> pd.DataFrame:
@@ -137,25 +140,6 @@ def build_native_categorical_pipeline(estimator) -> Pipeline:
     )
 
 
-def build_smote_pipeline(estimator) -> ImbPipeline:
-    """Same as build_pipeline, plus a SMOTE oversampling step right before
-    the classifier. imblearn's Pipeline (not sklearn's) is required here:
-    it applies the sampler only during .fit()/.fit_resample() on that
-    fold's training rows, and skips it entirely during .transform()/
-    .predict() — the leakage-safe way to combine SMOTE with
-    cross-validation. Several published benchmarks on this dataset use
-    SMOTE; several of the very high (>90%) accuracy claims found while
-    researching this turned out to apply it *before* the train/test split
-    instead, which leaks synthetic neighbors of test rows into training."""
-    return ImbPipeline(
-        steps=[
-            ("engineer", FeatureEngineer()),
-            ("segment", CustomerSegmentFeature(random_state=RANDOM_STATE)),
-            ("preprocess", build_preprocessor()),
-            ("smote", SMOTE(random_state=RANDOM_STATE)),
-            ("model", estimator),
-        ]
-    )
 
 
 def search_spaces(scale_pos_weight_options: list[float]) -> dict:
@@ -202,13 +186,14 @@ def search_spaces(scale_pos_weight_options: list[float]) -> dict:
                 "model__class_weight": [None, "balanced"],
             },
         ),
-        "hist_gradient_boosting_smote": (
+        "hist_gradient_boosting_weighted": (
             # Same model + search space as hist_gradient_boosting above,
-            # but with SMOTE oversampling instead of class weighting — an
-            # isolated, controlled test of whether SMOTE (the technique
-            # several published benchmarks on this dataset use, done
-            # correctly here — see build_smote_pipeline) beats what we
-            # already do for class imbalance.
+            # but with a wide positive-class weight sweep (1-30, see
+            # CLASS_WEIGHT_SWEEP) instead of SMOTE oversampling — an
+            # isolated, controlled test of whether weighting the loss
+            # function more aggressively than the narrow scale_pos_weight
+            # range used elsewhere (max ~2.76) does better than
+            # oversampling for class imbalance.
             HistGradientBoostingClassifier(random_state=RANDOM_STATE),
             {
                 "model__max_iter": [100, 200, 300],
@@ -216,7 +201,7 @@ def search_spaces(scale_pos_weight_options: list[float]) -> dict:
                 "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
                 "model__l2_regularization": [float(x) for x in np.logspace(-3, 1, 10)],
                 "model__max_leaf_nodes": [15, 31, 63, 127],
-                "smote__k_neighbors": [3, 5, 7],
+                "model__class_weight": CLASS_WEIGHT_SWEEP,
             },
         ),
         "mlp": (
@@ -377,15 +362,7 @@ def extract_feature_importance(pipeline, X_val: pd.DataFrame, y_val: pd.Series) 
         elif hasattr(model, "coef_"):
             values = np.abs(np.asarray(model.coef_[0], dtype=float))
         else:
-            # Walk every step's .transform() except the final model and
-            # any sampler (e.g. SMOTE) — samplers only implement
-            # fit_resample(), not transform(), and should never resample
-            # at inference/explanation time anyway, so p[:-1].transform()
-            # (which breaks if a sampler is second-to-last) isn't safe here.
-            transformed_val = X_val
-            for step_name, step_obj in p.steps:
-                if step_name not in ("model", "smote"):
-                    transformed_val = step_obj.transform(transformed_val)
+            transformed_val = p[:-1].transform(X_val)
             result = permutation_importance(
                 model, transformed_val, y_val,
                 n_repeats=10, random_state=RANDOM_STATE, scoring="roc_auc", n_jobs=-1,
@@ -452,13 +429,7 @@ def main() -> None:
 
     for name, (estimator, param_dist) in candidates.items():
         is_native = name == "catboost_native"
-        is_smote = name.endswith("_smote")
-        if is_native:
-            pipeline = build_native_categorical_pipeline(estimator)
-        elif is_smote:
-            pipeline = build_smote_pipeline(estimator)
-        else:
-            pipeline = build_pipeline(estimator)
+        pipeline = build_native_categorical_pipeline(estimator) if is_native else build_pipeline(estimator)
         fit_params = NATIVE_FIT_PARAMS if is_native else {}
 
         search = RandomizedSearchCV(
