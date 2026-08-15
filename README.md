@@ -69,11 +69,12 @@ requirements.txt
 ## Model
 
 `train/train.py` builds a pipeline of three steps — feature engineering,
-preprocessing, and a classifier — for each of seven model families
-(Logistic Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM,
-CatBoost with one-hot encoding, CatBoost with native categorical handling),
-plus two probability-averaging ensembles of the top-3 and all-7, and keeps
-whichever generalizes best. Concretely, per candidate:
+preprocessing, and a classifier — for each of ten model families (Logistic
+Regression, Random Forest, Extra Trees, Gradient Boosting, HistGradientBoosting,
+XGBoost, LightGBM, CatBoost with one-hot encoding, CatBoost with native
+categorical handling, a small MLP neural net), plus two probability-averaging
+ensembles of the top-3 and all-10, and keeps whichever generalizes best.
+Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): `num_addon_services`
@@ -125,51 +126,62 @@ model's best hyperparameters and CV scores):
 |---|---|---|---|---|---|
 | Logistic Regression | 0.850 | 0.61 | 0.773 | 0.622 | 0.837 |
 | Random Forest | 0.851 | 0.57 | 0.774 | 0.623 | 0.837 |
+| Extra Trees | 0.849 | 0.55 | 0.756 | 0.622 | 0.835 |
 | Gradient Boosting | 0.850 | 0.37 | 0.784 | 0.629 | 0.839 |
+| **HistGradientBoosting (selected)** | **0.848** | **0.34** | **0.773** | **0.638** | **0.835** |
 | XGBoost | 0.851 | 0.33 | 0.765 | 0.629 | 0.839 |
 | LightGBM | 0.850 | 0.46 | 0.766 | 0.627 | 0.836 |
 | CatBoost (one-hot) | 0.851 | 0.44 | 0.763 | 0.625 | 0.839 |
 | CatBoost (native categoricals) | 0.850 | 0.46 | 0.772 | 0.630 | 0.840 |
-| **Ensemble, top 3 (selected)** | **—** | **0.48** | **0.782** | **0.632** | **0.839** |
-| Ensemble, all 7 | — | 0.46 | 0.773 | 0.631 | 0.840 |
+| MLP (neural net) | 0.846 | 0.31 | 0.721 | 0.606 | 0.834 |
+| Ensemble, top 3 | — | 0.48 | 0.782 | 0.632 | 0.839 |
+| Ensemble, all 10 | — | 0.45 | 0.773 | 0.634 | 0.840 |
 
-The deployed model is now an ensemble (CatBoost one-hot + XGBoost + Random
-Forest) — the first time in this project an ensemble has actually won.
+The deployed model is now a **single** model again — scikit-learn's own
+`HistGradientBoostingClassifier` (a from-scratch reimplementation of the
+same histogram-binned-boosting idea as LightGBM, bundled with scikit-learn
+itself) beats every ensemble tried, despite having the *lowest* CV ROC-AUC
+of the top contenders. It found a precision/recall balance at its tuned
+threshold (0.34) that nothing else reached — a reminder that ROC-AUC
+(ranking quality) and F1 at a specific threshold (the actual deployment
+metric) don't always favor the same model. The MLP, included mainly to
+close the "did you try deep learning" question definitively, came in
+clearly last (0.606 F1) — expected on ~5.6k training rows of tabular data,
+now confirmed rather than assumed.
 
 ### Feature importance
 
 Full ranked list for the deployed model is written to
-`model/feature_importance.json` on every training run — for an ensemble,
-importances are averaged across its member pipelines. Top 5 (currently
-dominated by Contract, since CatBoost's importances weight it heavily):
+`model/feature_importance.json` on every training run. `HistGradientBoostingClassifier`
+exposes neither `feature_importances_` nor `coef_` (some scikit-learn
+estimators just don't), so for it — and any future candidate in the same
+position, like the MLP — the code falls back to **permutation importance**
+on the held-out test set (`sklearn.inspection.permutation_importance`,
+10 repeats, scored on ROC-AUC): a purely post-hoc explanation of the
+already-selected model, not a training or selection decision, so using
+the test set here doesn't leak into anything. Top 5:
 
 | Feature | Importance |
 |---|---|
-| `Contract` = Month-to-month | 23.8% |
-| `InternetService` = Fiber optic | 7.1% |
-| `tenure` | 6.5% |
-| `high_risk_new_customer` (new) | 5.7% |
-| `Contract` = Two year | 5.2% |
+| `Contract` = Month-to-month | 48.0% |
+| `tenure` | 16.5% |
+| `InternetService` = Fiber optic | 15.3% |
+| `TotalCharges` | 3.8% |
+| `MonthlyCharges` | 2.6% |
 
-...and the tail — the 10 least useful of the 51 encoded columns:
-
-| Feature | Importance |
-|---|---|
-| `PaymentMethod_Bank transfer (automatic)` | 0.35% |
-| `OnlineBackup_No` | 0.35% |
-| `PaymentMethod_Credit card (automatic)` | 0.31% |
-| `tenure_bucket_24-48` | 0.31% |
-| `tenure_bucket_12-24` | 0.29% |
-| `Partner_No` | 0.25% |
-| `DeviceProtection_Yes` | 0.22% |
-| `DeviceProtection_No` | 0.20% |
-| `Partner_Yes` | 0.19% |
-| `tenure_bucket_48-60` | 0.13% |
-
-14 of the 51 encoded columns carry <0.5% of total importance each — a
-combined 4.2%, in the same range as before. Same conclusion as previously:
-genuinely weak signal in those columns for this target, not another free
-cleanup opportunity.
+Permutation importance concentrates much more heavily on fewer features
+than the tree-native (split-gain) importance used for earlier models did
+(the previous top feature carried 24%, this one carries 48%) — expected,
+since it measures something different: how much performance drops when a
+feature is shuffled, which is naturally lower for any feature that's
+correlated with others the model can fall back on. 37 of the 51 encoded
+columns now show ~0% permutation importance, including several of the
+engineered features (`charges_delta`, `high_risk_new_customer`,
+`manual_payment`) that scored meaningfully under the old importance
+measure — not a contradiction, just a different lens: those features are
+useful but *redundant* with `Contract`/`tenure`/`InternetService`, so
+shuffling them alone barely hurts a model that can lean on the correlated
+signal instead.
 
 ### What moved the numbers, and what didn't
 
@@ -268,13 +280,51 @@ untouched test set:
 Net: modest, not dramatic — consistent with the ceiling already being
 close. But real, verified, multi-metric-consistent, and it came from
 specific, attributable techniques rather than "try more stuff and see."
-The deployed model is now `Ensemble (top 3)`. (Along the way, hit and
-fixed *two* separate CatBoost/scikit-learn interop bugs: `l2_leaf_reg` and
-`cat_features` both fail sklearn's `clone()` equality check when passed as
-constructor arguments — `l2_leaf_reg` fixed by casting to native Python
-floats, `cat_features` fixed by passing it through `.fit()` instead of the
-constructor, since `RandomizedSearchCV`/`cross_val_predict` support
-per-step fit params via the `model__cat_features=...` prefix convention.)
+(This round's deployed model, `Ensemble (top 3)`, was later superseded —
+see below.) Along the way, hit and fixed *two* separate CatBoost/scikit-learn
+interop bugs: `l2_leaf_reg` and `cat_features` both fail sklearn's `clone()`
+equality check when passed as constructor arguments — `l2_leaf_reg` fixed
+by casting to native Python floats, `cat_features` fixed by passing it
+through `.fit()` instead of the constructor, since
+`RandomizedSearchCV`/`cross_val_predict` support per-step fit params via
+the `model__cat_features=...` prefix convention.
+
+### Trying more model families
+
+Rounded out the model comparison with three more families through the same
+search/CV/threshold-tuning pipeline: `ExtraTreesClassifier` (Random
+Forest's more-randomized sibling), `HistGradientBoostingClassifier`
+(scikit-learn's own histogram-based boosting — the same algorithmic family
+as LightGBM, independently implemented, not yet tried), and a small
+`MLPClassifier` (mainly to answer "did you try a neural net" definitively).
+
+- **HistGradientBoostingClassifier won outright** — test F1 **0.638**,
+  beating every other individual model *and* both ensembles, despite having
+  the lowest CV ROC-AUC (0.848) among the strong contenders. It found a
+  precision/recall trade-off at its tuned threshold that nothing else
+  reached. Concretely: ROC-AUC measures ranking quality across all possible
+  thresholds; F1 measures performance at one specific threshold, which is
+  what's actually deployed — the two don't have to agree on which model is
+  "best," and here they didn't.
+- **Extra Trees landed right next to Random Forest** (0.622 vs. 0.623 F1)
+  — expected, they're closely related algorithms; no real signal either
+  way.
+- **The MLP clearly underperformed** (0.606 F1, worst of all ten
+  candidates) — expected on ~5.6k training rows of tabular data, and now
+  actually confirmed rather than assumed. Not worth pursuing further (e.g.
+  architecture tuning) given the gap.
+- **Fixed a real gap this surfaced**: `HistGradientBoostingClassifier` has
+  neither `feature_importances_` nor `coef_`, so `feature_importance.json`
+  was silently going stale (still describing whichever model won
+  *previously*) the first time this ran. Fixed with a permutation-importance
+  fallback (`sklearn.inspection.permutation_importance` on the held-out
+  test set, post-hoc only — doesn't affect model selection) for any
+  candidate lacking a native importance measure.
+
+The deployed model is now `HistGradientBoostingClassifier` alone — F1 0.638
+is the best result of the whole project, and it came from trying one more
+legitimately different algorithm family rather than further tuning the ones
+already tried.
 
 ### Beam search feature selection (tried, didn't generalize)
 
@@ -308,7 +358,7 @@ not discarded.
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
 the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
 `Medium` always straddles the actual Yes/No decision boundary, so it stays
-coherent even though thresholds vary a lot between models (0.33–0.61).
+coherent even though thresholds vary a lot between models (0.31–0.61).
 
 ## Local development
 
@@ -319,7 +369,7 @@ pip install -r requirements-dev.txt
 
 # Train the model (writes model/churn_model.joblib, decision_threshold.json,
 # metrics.json, feature_schema.json). Runs a hyperparameter search across
-# 7 model families with 5-fold CV, so it takes ~1-2min.
+# 10 model families with 5-fold CV, so it takes ~2-3min.
 python train/train.py
 
 # Run the tests
@@ -351,7 +401,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.7508,
+  "churn_probability": 0.6722,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }

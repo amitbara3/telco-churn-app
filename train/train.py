@@ -27,9 +27,16 @@ import pandas as pd
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_auc_score
 from sklearn.model_selection import (
     RandomizedSearchCV,
@@ -152,6 +159,46 @@ def search_spaces(scale_pos_weight_options: list[float]) -> dict:
                 "model__max_features": ["sqrt", "log2"],
             },
         ),
+        "extra_trees": (
+            # Random Forest's more-randomized sibling (splits chosen
+            # randomly rather than by best-gain search) — cheap to add,
+            # sometimes generalizes better than RF on noisy tabular data.
+            ExtraTreesClassifier(class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1),
+            {
+                "model__n_estimators": [200, 300, 400],
+                "model__max_depth": [4, 6, 8, 10, None],
+                "model__min_samples_leaf": [1, 2, 4, 8],
+                "model__min_samples_split": [2, 5, 10, 20],
+                "model__max_features": ["sqrt", "log2"],
+            },
+        ),
+        "hist_gradient_boosting": (
+            # scikit-learn's own histogram-based boosting (same family of
+            # algorithm as LightGBM, independently implemented) — hadn't
+            # been tried; unlike GradientBoostingClassifier it scales to
+            # this dataset's size the same way XGBoost/LightGBM do.
+            HistGradientBoostingClassifier(random_state=RANDOM_STATE),
+            {
+                "model__max_iter": [100, 200, 300],
+                "model__max_depth": [None, 3, 5, 7],
+                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+                "model__l2_regularization": [float(x) for x in np.logspace(-3, 1, 10)],
+                "model__max_leaf_nodes": [15, 31, 63, 127],
+                "model__class_weight": [None, "balanced"],
+            },
+        ),
+        "mlp": (
+            # A small neural net, mostly to answer "did you try deep
+            # learning" definitively rather than leave it assumed. Not
+            # expected to beat the tree ensembles on ~5.6k training rows
+            # of tabular data — worth confirming rather than assuming.
+            MLPClassifier(random_state=RANDOM_STATE, max_iter=500, early_stopping=True),
+            {
+                "model__hidden_layer_sizes": [(32,), (64,), (32, 16), (64, 32)],
+                "model__alpha": [float(x) for x in np.logspace(-4, 0, 10)],
+                "model__learning_rate_init": [0.001, 0.003, 0.01],
+            },
+        ),
         "gradient_boosting": (
             GradientBoostingClassifier(random_state=RANDOM_STATE),
             {
@@ -268,11 +315,18 @@ def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
     return best_t, best_f1
 
 
-def extract_feature_importance(pipeline) -> pd.Series | None:
+def extract_feature_importance(pipeline, X_val: pd.DataFrame, y_val: pd.Series) -> pd.Series | None:
     """Feature importances (normalized to sum to 1) for the final model,
     mapped back to real column names via the preprocessor. Handles a plain
-    Pipeline (tree models' feature_importances_, or |coef_| for linear
-    models) and an AverageProbabilityEnsemble (averages its members')."""
+    Pipeline (tree models' feature_importances_, |coef_| for linear models,
+    or permutation importance as a fallback for models with neither — e.g.
+    HistGradientBoostingClassifier, MLPClassifier) and an
+    AverageProbabilityEnsemble (averages its members').
+
+    X_val/y_val (the held-out test split) are only used for the
+    permutation-importance fallback — a post-hoc explanation of the
+    already-selected, already-evaluated model, not a training or
+    selection decision, so this doesn't leak into anything."""
 
     def single(p: Pipeline) -> pd.Series | None:
         model = p.named_steps["model"]
@@ -285,12 +339,22 @@ def extract_feature_importance(pipeline) -> pd.Series | None:
             names = model.feature_names_
         else:
             return None
+
         if hasattr(model, "feature_importances_"):
             values = np.asarray(model.feature_importances_, dtype=float)
         elif hasattr(model, "coef_"):
             values = np.abs(np.asarray(model.coef_[0], dtype=float))
         else:
-            return None
+            transformed_val = p[:-1].transform(X_val)
+            result = permutation_importance(
+                model, transformed_val, y_val,
+                n_repeats=10, random_state=RANDOM_STATE, scoring="roc_auc", n_jobs=-1,
+            )
+            # A shuffled feature can score *better* than intact by chance;
+            # clip those to 0 rather than let noise show up as "negative
+            # importance".
+            values = np.clip(result.importances_mean, 0, None)
+
         if values.sum() > 0:
             values = values / values.sum()
         return pd.Series(values, index=names)
@@ -445,7 +509,7 @@ def main() -> None:
         json.dumps({"selected_model": best_name, "candidates": results}, indent=2)
     )
 
-    importance = extract_feature_importance(best_pipeline)
+    importance = extract_feature_importance(best_pipeline, X_test, y_test)
     if importance is not None:
         IMPORTANCE_PATH.write_text(
             json.dumps(
