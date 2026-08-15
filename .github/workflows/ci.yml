@@ -24,6 +24,44 @@ jobs:
       - name: Run test suite
         run: python -m pytest tests/ -q
 
+  training:
+    name: Training script runs end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      # The test suite exercises the saved artifact, not the code that
+      # produces it — so a broken train/train.py would pass CI and only
+      # surface whenever someone next retrained. This runs it for real at a
+      # reduced search budget: enough to catch import errors, API drift and
+      # crashes, without spending the full ~2.5 minutes.
+      - name: Train (reduced budget)
+        env:
+          CHURN_SEARCH_ITER: "2"
+          CHURN_CV_FOLDS: "2"
+        run: python train/train.py
+
+      - name: Training produced every artifact the app needs
+        run: |
+          for f in churn_model.joblib decision_threshold.json metrics.json \
+                   feature_importance.json feature_schema.json; do
+            test -s "model/$f" || { echo "::error::model/$f missing or empty"; exit 1; }
+            echo "ok: model/$f"
+          done
+
+      # The freshly trained model is a reduced-budget one, so the shipped
+      # artifacts must not be left modified for any later job to pick up.
+      - name: Restore committed artifacts
+        run: git checkout -- model/
+
   docker:
     name: Docker image builds and serves
     runs-on: ubuntu-latest

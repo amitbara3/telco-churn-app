@@ -60,13 +60,24 @@ model/
 tests/
   test_api.py          HTTP-layer tests (pytest + FastAPI TestClient)
   test_pipeline.py     Model/pipeline tests, incl. train-vs-serve feature parity
+  test_streamlit_ui.py Headless UI tests (Streamlit AppTest) of the submit path
 .github/workflows/
-  ci.yml               Tests, plus a real Docker build + container smoke test
+  ci.yml               Tests, a real training run, and a Docker build + container smoke test
 Dockerfile
 start.sh              Container entrypoint
 requirements.txt      Direct dependencies (what you edit)
 requirements.lock     All 68 packages pinned + hashed, linux/py3.11 — what Docker installs
 ```
+
+## What CI actually verifies
+
+Three independent jobs, because each covers a failure the others miss:
+
+| Job | Catches |
+|---|---|
+| **Tests** (46) | API contract, train/serve feature parity, calibration not silently dropped, the Streamlit submit path |
+| **Training** | A broken `train/train.py`. The test suite exercises the saved *artifact*, so training code could break and stay green until someone next retrained. Runs for real at a reduced search budget. |
+| **Docker** | That the deployment target builds, boots, and answers on `/health`, `/predict` and the UI — plus reports image size |
 
 ## Operating it
 

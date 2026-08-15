@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -89,8 +90,11 @@ NATIVE_CATEGORICAL_COLUMNS = CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL
 FIT_PARAMS = {"model__cat_features": NATIVE_CATEGORICAL_COLUMNS}
 
 RANDOM_STATE = 42
-CV_FOLDS = 5
-SEARCH_ITER = 20
+# Overridable so CI can run this script end-to-end quickly. Nothing else
+# should change them: a real training run uses the defaults, and CI is
+# checking that the code executes, not reproducing the shipped model.
+CV_FOLDS = int(os.environ.get("CHURN_CV_FOLDS", 5))
+SEARCH_ITER = int(os.environ.get("CHURN_SEARCH_ITER", 20))
 
 
 def load_data() -> pd.DataFrame:
