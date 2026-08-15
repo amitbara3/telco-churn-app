@@ -198,11 +198,11 @@ full results table and per-model hyperparameters are in git history
 | MLP (sklearn, shallow) | 0.847 | 0.610 | 0.749 |
 
 Note these are the numbers *as the comparison was run*, before the blank
-`TotalCharges` rows were imputed rather than dropped (see below). That
-change shifted the train/test split slightly, which is why the deployed
-model's current figures at the top of this section read 0.634 / 0.764
-rather than the 0.636 / 0.763 shown here. The ranking is what this table
-is for; it wasn't re-run for all twelve after the data fix.
+`TotalCharges` rows were imputed rather than dropped, and before
+calibration. Those changes shifted the split and the probability scale,
+which is why the deployed model's current figures at the top of this
+section differ slightly. The ranking is what this table is for; it wasn't
+re-run for all twelve after each fix.
 
 Two things worth carrying forward from that exercise:
 
@@ -218,6 +218,68 @@ Two things worth carrying forward from that exercise:
   given free choice of depth, the ANN's search settled on the *smallest*
   architecture offered with the *highest* dropout — more capacity than
   ~5,600 rows of tabular data can constrain.
+
+### Feature engineering does not help on this dataset
+
+This is the most useful negative result here, because feature engineering
+is the obvious next thing to reach for once model choice is exhausted.
+
+Eight candidate features were tested, drawn from published Telco-churn
+repos ([tohid-yousefi](https://github.com/tohid-yousefi/Telco_Customer_Churn_Feature_Engineering),
+[DWoyda](https://github.com/DWoyda/telco-customer-churn-ibm-dataset)) plus
+two of my own around contract-renewal timing — arguably the strongest
+domain hypothesis available, since churn clusters at contract boundaries
+and neither `tenure` nor `Contract` alone expresses "about to expire":
+
+| Candidate | CV ROC-AUC | vs baseline |
+|---|---|---|
+| baseline (current features) | 0.84951 | — |
+| `total_services_8` (count over all 8 service columns) | 0.84905 | −0.00046 |
+| `contract_cycle` (months into term, cycles done, near-expiry flag) | 0.84905 | −0.00046 |
+| `charge_trajectory` (historic avg spend ÷ current rate) | 0.84901 | −0.00050 |
+| `no_protection` (missing any of backup/protection/support) | 0.84884 | −0.00067 |
+| `charges_per_tenure_ratio` | 0.84852 | −0.00099 |
+| `not_engaged_not_senior` | 0.84853 | −0.00098 |
+| `avg_service_fee` (MonthlyCharges ÷ services) | 0.84837 | −0.00114 |
+| `tenure_year_bucket` (yearly bins) | 0.84810 | −0.00141 |
+
+**Every single one made it worse.** Not by a meaningful amount — all
+deltas are an order of magnitude below the fold-to-fold std of 0.012 — but
+not one helped.
+
+This isn't a wiring bug: the new columns verifiably reach the model and
+get used heavily (`avg_service_fee` draws 9.7% of split importance,
+`contract_cycles_done` 4.4%). The model splits on them enthusiastically
+and generalizes no better.
+
+So the same question was turned on the features already shipped. Testing
+the full engineered set against the **raw 19 columns alone**, paired
+across 25 folds (5×5 repeated CV):
+
+```
+raw only (19 cols)        0.84946
+current (engineered)      0.84894
+paired difference         -0.00052   95% CI [-0.00114, +0.00010]   p = 0.118
+```
+
+Our own feature engineering doesn't help either. The difference is not
+statistically distinguishable from zero, and the point estimate is
+slightly *negative*.
+
+The mechanism is the same in both cases: every one of these features —
+mine, the repos', and the ones already shipped — is a deterministic
+function of columns the model already has. `MonthlyCharges ÷ services`,
+`tenure % contract_length`, `TotalCharges ÷ tenure`: a gradient-boosted
+tree can already express these by splitting on the inputs. Recombining
+existing columns cannot manufacture information; it only adds correlated
+copies that dilute split selection.
+
+The features are kept because removing them would churn a tested,
+deployed, calibrated model for a change the evidence says is worth
+nothing either way. But the finding is the actionable part: on this
+dataset, effort spent on feature engineering is effort wasted. Only
+genuinely new *data* — support tickets, usage trends, competitor pricing,
+whether a retention offer was made — can move this.
 
 ### What was tried and rejected
 
