@@ -1,0 +1,469 @@
+{
+  "best_subset": [
+    "Contract",
+    "InternetService",
+    "MultipleLines",
+    "OnlineBackup",
+    "OnlineSecurity",
+    "PaperlessBilling",
+    "Partner",
+    "PaymentMethod",
+    "PhoneService",
+    "TechSupport",
+    "TotalCharges",
+    "avg_charge_per_tenure",
+    "is_new_customer",
+    "num_addon_services",
+    "tenure_bucket"
+  ],
+  "best_balanced_accuracy": 0.723088260302704,
+  "beam_width": 5,
+  "patience": 10,
+  "history": [
+    {
+      "round": 1,
+      "best_subset": [
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.6135435308979893
+    },
+    {
+      "round": 2,
+      "best_subset": [
+        "InternetService",
+        "TotalCharges"
+      ],
+      "best_balanced_accuracy": 0.6942787499898775
+    },
+    {
+      "round": 3,
+      "best_subset": [
+        "InternetService",
+        "MonthlyCharges",
+        "TotalCharges"
+      ],
+      "best_balanced_accuracy": 0.6968680913780398
+    },
+    {
+      "round": 4,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "MonthlyCharges",
+        "TotalCharges"
+      ],
+      "best_balanced_accuracy": 0.7052641168706018
+    },
+    {
+      "round": 5,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.7099872861110886
+    },
+    {
+      "round": 6,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "PaperlessBilling",
+        "TechSupport",
+        "avg_charge_per_tenure",
+        "tenure"
+      ],
+      "best_balanced_accuracy": 0.7130548154866505
+    },
+    {
+      "round": 7,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "OnlineSecurity",
+        "PaymentMethod",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.7136722893907861
+    },
+    {
+      "round": 8,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "OnlineBackup",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TechSupport",
+        "avg_charge_per_tenure",
+        "tenure"
+      ],
+      "best_balanced_accuracy": 0.715886287625418
+    },
+    {
+      "round": 9,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "MultipleLines",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.7192595171961422
+    },
+    {
+      "round": 10,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "MultipleLines",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.7209317579988177
+    },
+    {
+      "round": 11,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "MultipleLines",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7216006543198878
+    },
+    {
+      "round": 12,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7221484852656553
+    },
+    {
+      "round": 13,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "gender",
+        "is_new_customer"
+      ],
+      "best_balanced_accuracy": 0.7224768599123795
+    },
+    {
+      "round": 14,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "PaymentMethod",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "gender",
+        "is_new_customer",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7208621150404496
+    },
+    {
+      "round": 15,
+      "best_subset": [
+        "Contract",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.723088260302704
+    },
+    {
+      "round": 16,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "gender",
+        "is_new_customer",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.722499534363941
+    },
+    {
+      "round": 17,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MonthlyCharges",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "gender",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7210815713394932
+    },
+    {
+      "round": 18,
+      "best_subset": [
+        "Contract",
+        "Dependents",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "gender",
+        "is_new_customer",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7214386939515901
+    },
+    {
+      "round": 19,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MonthlyCharges",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7211617417218007
+    },
+    {
+      "round": 20,
+      "best_subset": [
+        "Contract",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "SeniorCitizen",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "charges_delta",
+        "gender",
+        "is_new_customer",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7201235757610113
+    },
+    {
+      "round": 21,
+      "best_subset": [
+        "Contract",
+        "Dependents",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "SeniorCitizen",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "charges_delta",
+        "gender",
+        "is_new_customer",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.71906273534866
+    },
+    {
+      "round": 22,
+      "best_subset": [
+        "Contract",
+        "Dependents",
+        "DeviceProtection",
+        "InternetService",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "SeniorCitizen",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "charges_delta",
+        "gender",
+        "is_new_customer",
+        "tenure",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7182440256869145
+    },
+    {
+      "round": 23,
+      "best_subset": [
+        "Contract",
+        "Dependents",
+        "DeviceProtection",
+        "InternetService",
+        "MonthlyCharges",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "SeniorCitizen",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "charges_delta",
+        "gender",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7191550527585899
+    },
+    {
+      "round": 24,
+      "best_subset": [
+        "Contract",
+        "Dependents",
+        "DeviceProtection",
+        "InternetService",
+        "MonthlyCharges",
+        "MultipleLines",
+        "OnlineBackup",
+        "OnlineSecurity",
+        "PaperlessBilling",
+        "Partner",
+        "PaymentMethod",
+        "PhoneService",
+        "SeniorCitizen",
+        "StreamingMovies",
+        "StreamingTV",
+        "TechSupport",
+        "TotalCharges",
+        "avg_charge_per_tenure",
+        "charges_delta",
+        "gender",
+        "is_new_customer",
+        "num_addon_services",
+        "tenure",
+        "tenure_bucket"
+      ],
+      "best_balanced_accuracy": 0.7147784787062605
+    }
+  ],
+  "full_feature_set_balanced_accuracy": 0.7159664580077255
+}

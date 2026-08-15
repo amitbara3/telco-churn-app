@@ -48,6 +48,7 @@ app/
   streamlit_app.py    Streamlit form UI, calls the API
 train/
   train.py            Feature engineering, hyperparameter search, CV, threshold tuning
+  beam_search.py       Beam search feature selection experiment (see README; not adopted)
 data/
   Telco-Customer-Churn.csv   Raw dataset (7,043 rows)
 model/
@@ -56,6 +57,7 @@ model/
   metrics.json          Evaluation metrics for all candidate models
   feature_importance.json  Full ranked feature importances of the deployed model
   feature_schema.json    Allowed categories / numeric ranges, used by the UI
+  beam_search_result.json  Beam search run's history and result (not the deployed feature set)
 tests/
   test_api.py          API tests (pytest + FastAPI TestClient)
 Dockerfile
@@ -192,6 +194,35 @@ consistent across the board — and further confirmation that we're now
 close to what these 19 raw features can support. The next real gain would
 come from new data (support tickets, usage patterns, competitor pricing
 signals), not more modeling.
+
+### Beam search feature selection (tried, didn't generalize)
+
+`train/beam_search.py` runs a forward beam search over the 24 candidate
+columns (beam width 5, patience 10, ordered by the aggregate importance
+from `model/feature_importance.json`), scoring each candidate subset by
+5-fold cross-validated balanced accuracy — entirely on the training split,
+never touching test. It found a 15-feature subset scoring 0.7231 vs. 0.7160
+for the full set — a real train-CV improvement.
+
+Validated against the held-out test set, it **didn't hold up**: the full
+24-feature model wins on every test metric, including the one the search
+optimized for —
+
+| | Train-CV bal. acc | Test bal. acc | Test F1 | Test ROC-AUC |
+|---|---|---|---|---|
+| Full set (24 features, deployed) | 0.7160 | **0.7640** | **0.6316** | **0.8399** |
+| Beam subset (15 features) | 0.7231 | 0.7544 | 0.6244 | 0.8383 |
+
+This is the search overfitting its own validation criterion: scoring
+~1,500+ candidate subsets against the same 5 CV folds lets the eventual
+"winner" pick up an optimistic score from sheer multiple-comparisons luck
+rather than real signal — the classic failure mode of greedy wrapper-based
+feature selection without nested CV. It also explains why the subset drops
+`charges_delta`, which is genuinely useful in the full model (3rd-highest
+importance) but happened to look replaceable within the specific folds the
+search kept re-using. **Not adopted** — the full feature set stays
+deployed. Kept in the repo as a working tool and an honest negative result,
+not discarded.
 
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
 the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
