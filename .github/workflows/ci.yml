@@ -70,8 +70,26 @@ jobs:
           echo "$response"
           echo "$response" | grep -q churn_probability
 
+      # Streamlit starts only after start.sh confirms the API is healthy,
+      # and then takes a few seconds to bind — so this has to poll rather
+      # than check once, the way the API step does.
       - name: Streamlit UI is served
-        run: curl -sf -o /dev/null -w '%{http_code}\n' http://localhost:7860 | grep -q 200
+        run: |
+          for _ in $(seq 1 45); do
+            if curl -sf -o /dev/null http://localhost:7860; then
+              echo "Streamlit UI is serving."
+              exit 0
+            fi
+            if ! docker ps --filter name=churn --filter status=running -q | grep -q .; then
+              echo "::error::Container exited while waiting for the UI."
+              docker logs churn
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::Streamlit UI never became reachable."
+          docker logs churn
+          exit 1
 
       - name: Container logs
         if: always()
