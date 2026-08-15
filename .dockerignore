@@ -13,7 +13,7 @@ README.md
 requirements-dev.txt
 catboost_info/
 
-# Training artifacts that nothing reads at serve time. churn_model.joblib,
-# decision_threshold.json and feature_schema.json are all still needed.
-model/metrics.json
+# Training artifact nothing reads at serve time. churn_model.joblib,
+# decision_threshold.json and feature_schema.json are needed by the app,
+# and metrics.json backs the /model-info endpoint.
 model/feature_importance.json

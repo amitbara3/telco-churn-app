@@ -42,7 +42,7 @@ container for free, one-service hosting on Spaces.
 
 ```
 app/
-  main.py            FastAPI app (/health, /predict)
+  main.py            FastAPI app (/health, /predict, /model-info)
   model.py            Loads the trained pipeline + threshold, runs predictions
   features.py           Row-wise feature engineering (shared by train + API)
   schemas.py           Pydantic request/response models
@@ -64,8 +64,31 @@ tests/
   ci.yml               Tests, plus a real Docker build + container smoke test
 Dockerfile
 start.sh              Container entrypoint
-requirements.txt
+requirements.txt      Direct dependencies (what you edit)
+requirements.lock     All 68 packages pinned + hashed, linux/py3.11 — what Docker installs
 ```
+
+## Operating it
+
+- **`GET /health`** — liveness. `start.sh` and the Docker `HEALTHCHECK`
+  both probe this, and the CI container test waits on it.
+- **`GET /model-info`** — what a running instance is actually serving:
+  model name, calibration method, decision threshold, and its held-out
+  metrics. Lets you confirm a deployment picked up the model you think it
+  did without shelling into the container.
+- **`POST /predict`** — one JSON line per prediction is written to stdout:
+
+  ```json
+  {"event": "prediction", "churn_probability": 0.6804, "churn_prediction": "Yes",
+   "risk_level": "High", "tenure_bucket": "0-12", "latency_ms": 39.21}
+  ```
+
+  Enough to watch the output distribution and latency for drift, which is
+  what silently degrades a churn model once the calibration stops matching
+  reality. Deliberately **no customer attributes** — the request body is
+  personal data, and `tenure` is coarsened to a band rather than logged
+  raw. A test asserts the payload contains exactly these keys, so this
+  can't quietly grow to include PII.
 
 ## Model
 
@@ -608,19 +631,62 @@ for the API.
 
 ## Deploying to Hugging Face Spaces
 
-This repo is ready to push straight to a Space — the README frontmatter
-above (`sdk: docker`, `app_port: 7860`) is exactly what Spaces reads to
-configure the build.
+This repo pushes straight to a Space with no changes. The YAML frontmatter
+at the top of this file (`sdk: docker`, `app_port: 7860`) is what Spaces
+reads to configure the build, and the image already runs as UID 1000 with
+a writable `HOME`, which is what Spaces requires.
 
-1. Create a new Space at https://huggingface.co/new-space with **Docker**
-   as the SDK.
-2. Add it as a git remote and push:
-   ```bash
-   git remote add hf https://huggingface.co/spaces/<your-username>/<space-name>
-   git push hf main
-   ```
-3. The Space will build the Dockerfile and come up at
-   `https://huggingface.co/spaces/<your-username>/<space-name>`.
+**1. Create the Space.** Go to https://huggingface.co/new-space and pick:
+
+| Setting | Value |
+|---|---|
+| Space name | e.g. `telco-churn-app` |
+| License | your choice |
+| SDK | **Docker** → *Blank* |
+| Hardware | *CPU basic* (free) is enough |
+| Visibility | Public or Private |
+
+**2. Authenticate git against Hugging Face.** Create a token with **write**
+scope at https://huggingface.co/settings/tokens, then:
+
+```bash
+pip install -U huggingface_hub
+huggingface-cli login          # paste the write token
+```
+
+**3. Push this repo to the Space:**
+
+```bash
+git remote add hf https://huggingface.co/spaces/<your-username>/<space-name>
+git push hf main
+```
+
+**4. Watch it build.** The Space page shows build logs. First build takes
+a few minutes (it installs CatBoost, pandas and Streamlit). When it goes
+green, the Streamlit UI is at
+`https://huggingface.co/spaces/<your-username>/<space-name>`.
+
+**5. Confirm what actually deployed:**
+
+```bash
+curl https://<your-username>-<space-name>.hf.space/model-info
+```
+
+Notes and gotchas:
+
+- **Only port 7860 is exposed publicly.** Spaces routes to `app_port`, so
+  the Streamlit UI is reachable from outside and the FastAPI backend on
+  8000 is internal to the container. That's intentional — Streamlit calls
+  it over localhost. To expose the API publicly instead, set
+  `app_port: 8000` in the frontmatter and change `start.sh` to run uvicorn
+  in the foreground.
+- **The model is committed to the repo** (`model/churn_model.joblib`,
+  0.7 MB), so the Space needs no training step and no external storage.
+- **Free Spaces sleep when idle** and take ~30s to wake. The container
+  itself starts in about 4 seconds once running.
+- **If the build fails**, compare against CI: the `docker` job here builds
+  the identical image and boots it, so a green CI run and a failing Space
+  points at a platform difference rather than the Dockerfile.
 
 ## Deploying to Render instead
 

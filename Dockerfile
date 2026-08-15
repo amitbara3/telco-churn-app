@@ -16,8 +16,13 @@ ENV HOME=/home/appuser \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR $HOME/app
 
-COPY --chown=appuser:appuser requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# requirements.lock pins all 68 packages (direct + transitive) with hashes,
+# resolved for linux/py3.11 — this image, not a developer's laptop.
+# requirements.txt alone pins only the 10 direct dependencies, so a rebuild
+# months from now could silently resolve different transitive versions than
+# the ones CI verified.
+COPY --chown=appuser:appuser requirements.lock .
+RUN pip install --no-cache-dir --user --require-hashes -r requirements.lock
 
 COPY --chown=appuser:appuser app ./app
 COPY --chown=appuser:appuser model ./model

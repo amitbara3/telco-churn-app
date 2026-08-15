@@ -37,6 +37,18 @@ jobs:
       - name: Build image
         run: docker build -t telco-churn-app .
 
+      - name: Report image size
+        run: |
+          size=$(docker image inspect telco-churn-app --format '{{.Size}}')
+          mb=$((size / 1000000))
+          echo "Image size: ${mb} MB"
+          echo "### Docker image: ${mb} MB" >> "$GITHUB_STEP_SUMMARY"
+          # Hugging Face Spaces allows well above this; the check is here to
+          # make an accidental jump (a stray heavy dependency) visible.
+          if [ "$mb" -gt 2000 ]; then
+            echo "::warning::Image is ${mb} MB — larger than expected for this app."
+          fi
+
       - name: Start container
         run: |
           docker run -d --name churn -p 7860:7860 -p 8000:8000 telco-churn-app

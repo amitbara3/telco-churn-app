@@ -92,6 +92,25 @@ class CustomerFeatures(BaseModel):
 
 
 class PredictionResponse(BaseModel):
-    churn_probability: float = Field(description="Model probability of churn, 0-1")
+    churn_probability: float = Field(
+        description="Calibrated probability of churn, 0-1. Calibrated means "
+        "0.7 really does correspond to roughly a 70% churn rate."
+    )
     churn_prediction: Literal["Yes", "No"]
     risk_level: Literal["Low", "Medium", "High"]
+
+
+class ModelInfo(BaseModel):
+    """What a running instance is actually serving."""
+
+    model: str
+    calibration: str | None
+    decision_threshold: float
+    test_churn_f1: float | None
+    test_balanced_accuracy: float | None
+    test_roc_auc: float | None
+    expected_calibration_error: float | None
+
+    # `model` collides with pydantic's protected namespace; this field is
+    # the model's *name*, so keep it rather than rename the API surface.
+    model_config = {"protected_namespaces": ()}

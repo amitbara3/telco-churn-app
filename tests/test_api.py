@@ -1,3 +1,6 @@
+import json
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -74,6 +77,51 @@ def test_predict_rejects_out_of_range_numbers(field, value):
     edge rather than answer a question the model can't actually answer."""
     response = client.post("/predict", json={**SAMPLE_CUSTOMER, field: value})
     assert response.status_code == 422
+
+
+def test_model_info_reports_what_is_deployed():
+    response = client.get("/model-info")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "catboost_native"
+    assert body["calibration"] == "sigmoid"
+    assert 0.0 < body["decision_threshold"] < 1.0
+
+
+def test_logger_emits_independently_of_the_root_logger():
+    """uvicorn installs handlers on its own loggers and leaves root bare, so
+    a module logger that only propagates emits nothing in production while
+    still passing a caplog-based test. This asserts the configuration that
+    makes it actually emit — the check that would have caught that."""
+    logger = logging.getLogger("churn")
+    assert logger.handlers, "no handler: nothing will be written under uvicorn"
+    assert logger.level <= logging.INFO
+    assert logger.propagate is False, "would double-log if root is configured"
+
+
+def test_prediction_is_logged_without_customer_details(caplog):
+    """Logs must carry enough to monitor output drift, but no customer
+    attributes — the request body is personal data."""
+    logger = logging.getLogger("churn")
+    # Attach caplog's handler directly: the logger deliberately does not
+    # propagate to root, which is where caplog normally listens.
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger="churn"):
+            client.post("/predict", json=SAMPLE_CUSTOMER)
+    finally:
+        logger.removeHandler(caplog.handler)
+
+    records = [r.message for r in caplog.records if '"event": "prediction"' in r.message]
+    assert records, "prediction was not logged"
+    logged = json.loads(records[0])
+    assert set(logged) == {
+        "event", "churn_probability", "churn_prediction",
+        "risk_level", "tenure_bucket", "latency_ms",
+    }
+    # None of the raw customer attributes may appear anywhere in the line.
+    for field in ("PaymentMethod", "Contract", "MonthlyCharges", "TotalCharges", "gender"):
+        assert field not in records[0]
 
 
 def test_predict_accepts_brand_new_customer():

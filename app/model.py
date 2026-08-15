@@ -31,6 +31,38 @@ def load_threshold() -> float:
     return json.loads(THRESHOLD_PATH.read_text())["threshold"]
 
 
+@lru_cache(maxsize=1)
+def load_metadata() -> dict:
+    """Identity of the deployed model, for /model-info.
+
+    Reads metrics.json when it's present, but does not require it: the
+    Docker image deliberately excludes training artifacts, so this has to
+    degrade rather than fail there.
+    """
+    meta = {
+        "model": "unknown",
+        "calibration": None,
+        "decision_threshold": load_threshold(),
+        "test_churn_f1": None,
+        "test_balanced_accuracy": None,
+        "test_roc_auc": None,
+        "expected_calibration_error": None,
+    }
+    metrics_path = ROOT / "model" / "metrics.json"
+    if metrics_path.exists():
+        m = json.loads(metrics_path.read_text())
+        t = m.get("test_metrics", {})
+        meta.update(
+            model=m.get("model", "unknown"),
+            calibration=m.get("calibration"),
+            test_churn_f1=t.get("f1"),
+            test_balanced_accuracy=t.get("balanced_accuracy"),
+            test_roc_auc=t.get("roc_auc"),
+            expected_calibration_error=t.get("expected_calibration_error"),
+        )
+    return meta
+
+
 def predict(features: dict) -> dict:
     pipeline = load_pipeline()
     threshold = load_threshold()
