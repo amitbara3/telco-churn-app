@@ -274,12 +274,52 @@ tree can already express these by splitting on the inputs. Recombining
 existing columns cannot manufacture information; it only adds correlated
 copies that dilute split selection.
 
-The features are kept because removing them would churn a tested,
-deployed, calibrated model for a change the evidence says is worth
+**Target-derived features, the one class that argument doesn't cover.**
+The above all fail for the same structural reason, so it's worth testing
+the exception: features built from the *labels* rather than from the
+inputs genuinely can add information. Two were tried, both fit inside the
+pipeline so per-fold refitting keeps the target statistics away from their
+own validation rows. Paired over 15 folds (5×3 repeated CV):
+
+| Configuration | CV ROC-AUC | Paired diff | p |
+|---|---|---|---|
+| baseline | 0.84898 | — | — |
+| + Kaplan-Meier hazard & survival | 0.84693 | **−0.00206** | **0.011** |
+| + smoothed target/WoE encoding | 0.84938 | +0.00040 | 0.173 |
+| + both | 0.84742 | −0.00156 | 0.037 |
+
+Kaplan-Meier hazard features — motivated by the survival-analysis churn
+literature ([hybrid ML + survival framework](https://doi.org/10.3390/info17070680),
+and the Kaplan-Meier estimator used in [e-Profits](https://arxiv.org/abs/2507.08860))
+— make the model **significantly worse**, not merely no better. The
+tenure-conditioned hazard is estimated from ~4,500 training rows spread
+over 73 distinct tenure values, so the tail estimates are noisy, and the
+booster happily trusts a target-derived feature that is partly memorised
+noise.
+
+Target encoding is a wash, for a specific reason: CatBoost's native
+categorical handling already computes *ordered* target statistics
+internally, and its ordered variant is the leakage-safe version of exactly
+this. Adding an explicit encoding duplicates what the model already does,
+slightly worse.
+
+**What the literature says actually works.** The one paper found that
+reports a large jump —
+[churn prediction with social network analysis](https://arxiv.org/pdf/1904.00690),
+84% → 93.3% AUC — gets it from call-graph features: who calls whom, and
+whether *those* people have already churned. That is not feature
+engineering in the sense tested here. It is a different and much richer
+data source, on a proprietary operator dataset with call detail records.
+It corroborates the conclusion rather than contradicting it: the gain came
+from new information, not from recombining the columns already on hand.
+
+The existing features are kept because removing them would churn a
+tested, deployed, calibrated model for a change the evidence says is worth
 nothing either way. But the finding is the actionable part: on this
-dataset, effort spent on feature engineering is effort wasted. Only
+dataset, across deterministic recombinations *and* target-derived
+features, effort spent on feature engineering is effort wasted. Only
 genuinely new *data* — support tickets, usage trends, competitor pricing,
-whether a retention offer was made — can move this.
+call-graph structure, whether a retention offer was made — can move this.
 
 ### What was tried and rejected
 
