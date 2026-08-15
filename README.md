@@ -146,6 +146,13 @@ full results table and per-model hyperparameters are in git history
 | ANN (Keras, batch norm + dropout) | 0.839 | 0.611 | 0.741 |
 | MLP (sklearn, shallow) | 0.847 | 0.610 | 0.749 |
 
+Note these are the numbers *as the comparison was run*, before the blank
+`TotalCharges` rows were imputed rather than dropped (see below). That
+change shifted the train/test split slightly, which is why the deployed
+model's current figures at the top of this section read 0.634 / 0.764
+rather than the 0.636 / 0.763 shown here. The ranking is what this table
+is for; it wasn't re-run for all twelve after the data fix.
+
 Two things worth carrying forward from that exercise:
 
 - **The field is extremely tight.** Twelve genuinely different algorithms
@@ -258,35 +265,35 @@ column*, not per category level. Top 5:
 
 | Feature | Importance |
 |---|---|
-| `Contract` | 25.5% |
-| `InternetService` | 18.8% |
-| `tenure` | 6.7% |
-| `MonthlyCharges` | 5.1% |
-| `PaymentMethod` | 4.6% |
+| `Contract` | 20.5% |
+| `InternetService` | 18.5% |
+| `tenure` | 9.5% |
+| `MonthlyCharges` | 5.7% |
+| `TotalCharges` | 5.5% |
 
 ...and the tail — the 10 least useful of the 29 raw + engineered columns:
 
 | Feature | Importance |
 |---|---|
-| `StreamingTV` | 1.4% |
-| `SeniorCitizen` | 1.2% |
-| `Dependents` | 1.0% |
-| `has_streaming` | 1.0% |
-| `PhoneService` | 0.9% |
-| `gender` | 0.6% |
-| `OnlineBackup` | 0.4% |
-| `manual_payment` | 0.2% |
-| `Partner` | 0.1% |
-| `DeviceProtection` | 0.0% (literally unused, again) |
+| `TechSupport` | 0.82% |
+| `StreamingTV` | 0.78% |
+| `manual_payment` | 0.62% |
+| `SeniorCitizen` | 0.56% |
+| `Dependents` | 0.51% |
+| `gender` | 0.44% |
+| `has_streaming` | 0.41% |
+| `OnlineBackup` | 0.09% |
+| `Partner` | 0.07% |
+| `DeviceProtection` | 0.01% (effectively unused, as in every earlier run) |
 
-Only 4 of 29 columns fall under the 0.5%-each dead-weight threshold now
-(combined 0.7%) — much cleaner than the one-hot-expanded counts earlier in
-this project (which were never comparing like for like: one raw column vs.
-several one-hot levels of it). `Contract` and `InternetService` alone
-account for 44% of total importance, consistent with every other lens
-applied to this dataset throughout — segment analysis, permutation
-importance, the paper's own SHAP results — all agree these two features
-(plus tenure) carry most of the real signal.
+Only 5 of 29 columns fall below the 0.5%-each dead-weight threshold,
+carrying 1.0% between them — much cleaner than the one-hot-expanded counts
+earlier in this project, though those were never comparing like for like
+(one raw column vs. several one-hot levels of it). `Contract` and
+`InternetService` alone account for 39% of total importance, consistent
+with every other lens applied to this dataset — segment analysis,
+permutation importance, and the reference paper's SHAP results all agree
+these two (plus tenure) carry most of the real signal.
 
 ### Where the ceiling actually is
 
@@ -409,7 +416,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.7584,
+  "churn_probability": 0.7573,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }
@@ -443,10 +450,14 @@ configure the build.
 
 ## Deploying to Render instead
 
-Render can build the same `Dockerfile` directly (New → Web Service → point
-at this repo → Environment: Docker). Render expects the service to listen
-on `$PORT`; either set the Streamlit/uvicorn ports from that env var, or
-simplest for an API-only deploy, change the Dockerfile's `CMD` to just:
+Render builds the same `Dockerfile` with no changes (New → Web Service →
+point at this repo → Environment: Docker). Render injects `$PORT` and
+expects the service to listen on it; `start.sh` already reads `$PORT` for
+the Streamlit UI (falling back to 7860 for Hugging Face Spaces), so the
+image works on either platform as-is.
+
+The FastAPI backend stays on `$API_PORT` (default 8000) inside the
+container. To deploy the API alone without the UI, override the command:
 
 ```dockerfile
 CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
