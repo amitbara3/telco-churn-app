@@ -6,31 +6,11 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
+from app.features import RAW_FEATURE_ORDER
+
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = ROOT / "model" / "churn_model.joblib"
 THRESHOLD_PATH = ROOT / "model" / "decision_threshold.json"
-
-FEATURE_ORDER = [
-    "gender",
-    "SeniorCitizen",
-    "Partner",
-    "Dependents",
-    "tenure",
-    "PhoneService",
-    "MultipleLines",
-    "InternetService",
-    "OnlineSecurity",
-    "OnlineBackup",
-    "DeviceProtection",
-    "TechSupport",
-    "StreamingTV",
-    "StreamingMovies",
-    "Contract",
-    "PaperlessBilling",
-    "PaymentMethod",
-    "MonthlyCharges",
-    "TotalCharges",
-]
 
 
 @lru_cache(maxsize=1)
@@ -54,7 +34,7 @@ def load_threshold() -> float:
 def predict(features: dict) -> dict:
     pipeline = load_pipeline()
     threshold = load_threshold()
-    row = pd.DataFrame([{col: features[col] for col in FEATURE_ORDER}])
+    row = pd.DataFrame([{col: features[col] for col in RAW_FEATURE_ORDER}])
 
     probability = float(pipeline.predict_proba(row)[0, 1])
     prediction = "Yes" if probability >= threshold else "No"

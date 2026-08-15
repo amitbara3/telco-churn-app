@@ -12,6 +12,37 @@ cross-validation without leaking information across folds.
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+# Single source of truth for the raw request schema and its column order.
+# Both train.py (what the model is fit on) and model.py (what a live
+# request is turned into) import this — previously they each hardcoded
+# their own copy, and the two lists silently drifted out of order. That
+# was harmless for one-hot pipelines (ColumnTransformer selects columns by
+# name, order-independent) but broke CatBoost's native-categorical mode,
+# which resolves cat_features to positional indices at fit time: a
+# differently-ordered DataFrame at serve time silently fed categorical
+# strings into columns CatBoost expected to be numeric.
+CATEGORICAL_FEATURES = [
+    "gender",
+    "Partner",
+    "Dependents",
+    "PhoneService",
+    "MultipleLines",
+    "InternetService",
+    "OnlineSecurity",
+    "OnlineBackup",
+    "DeviceProtection",
+    "TechSupport",
+    "StreamingTV",
+    "StreamingMovies",
+    "Contract",
+    "PaperlessBilling",
+    "PaymentMethod",
+]
+NUMERIC_FEATURES = ["SeniorCitizen", "tenure", "MonthlyCharges", "TotalCharges"]
+RAW_FEATURE_ORDER = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 ADDON_SERVICE_COLUMNS = [
     "OnlineSecurity",
@@ -51,7 +82,7 @@ HIGH_RISK_TENURE_MONTHS = 12
 # arXiv:2607.10260, engineered an equivalent "payment stability" feature).
 MANUAL_PAYMENT_METHODS = {"Electronic check", "Mailed check"}
 
-ENGINEERED_CATEGORICAL = ["tenure_bucket"]
+ENGINEERED_CATEGORICAL = ["tenure_bucket", "customer_segment"]
 ENGINEERED_NUMERIC = [
     "num_addon_services",
     "avg_charge_per_tenure",
@@ -104,6 +135,43 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         for col, redundant_value in NO_SERVICE_TO_NO_COLUMNS.items():
             X[col] = X[col].replace(redundant_value, "No")
 
+        return X
+
+
+class CustomerSegmentFeature(BaseEstimator, TransformerMixin):
+    """K-Means customer segmentation (tenure, MonthlyCharges, TotalCharges,
+    num_addon_services) as an additional categorical feature — inspired by
+    an independent benchmark on this same dataset (arXiv:2607.10260) that
+    used K=3 segments for its churn-risk/value analysis.
+
+    Unlike FeatureEngineer's row-wise columns, this genuinely needs
+    fitting (cluster centers learned from data), so it's its own pipeline
+    step placed right after FeatureEngineer. Cross-validation machinery
+    calls .fit() separately per fold, so the cluster centers are always
+    learned from that fold's training rows only — no leakage from
+    validation/test rows into where the cluster boundaries land.
+    """
+
+    CLUSTER_COLUMNS = ["tenure", "MonthlyCharges", "TotalCharges", "num_addon_services"]
+
+    def __init__(self, n_clusters: int = 3, random_state: int = 42):
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+
+    def fit(self, X: pd.DataFrame, y=None) -> "CustomerSegmentFeature":
+        self.scaler_ = StandardScaler().fit(X[self.CLUSTER_COLUMNS])
+        scaled = self.scaler_.transform(X[self.CLUSTER_COLUMNS])
+        self.kmeans_ = KMeans(
+            n_clusters=self.n_clusters, random_state=self.random_state, n_init=10
+        ).fit(scaled)
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+        scaled = self.scaler_.transform(X[self.CLUSTER_COLUMNS])
+        X["customer_segment"] = "segment_" + pd.Series(
+            self.kmeans_.predict(scaled), index=X.index
+        ).astype(str)
         return X
 
 
