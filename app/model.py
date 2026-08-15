@@ -59,9 +59,15 @@ def predict(features: dict) -> dict:
     probability = float(pipeline.predict_proba(row)[0, 1])
     prediction = "Yes" if probability >= threshold else "No"
 
-    if probability < 0.33:
+    # Risk bands are anchored to the tuned decision threshold rather than
+    # fixed at 0.33/0.66, so "Medium" always straddles the actual Yes/No
+    # cutoff instead of drifting out of sync with it (the threshold can be
+    # well below 0.5 — e.g. ~0.29 for the current model).
+    low_cut = threshold / 2
+    high_cut = (1 + threshold) / 2
+    if probability < low_cut:
         risk = "Low"
-    elif probability < 0.66:
+    elif probability < high_cut:
         risk = "Medium"
     else:
         risk = "High"

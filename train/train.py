@@ -24,9 +24,11 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_auc_score
 from sklearn.model_selection import (
     RandomizedSearchCV,
@@ -86,16 +88,24 @@ def load_data() -> pd.DataFrame:
 
 
 def build_preprocessor() -> ColumnTransformer:
-    return ColumnTransformer(
+    # Dense output + pandas column names throughout (rather than the
+    # default sparse/ndarray output) so the same column-labeled frame shape
+    # flows through fit *and* predict for every candidate — LightGBM's
+    # sklearn wrapper otherwise warns loudly about feature-name mismatches
+    # between training (array with generated names) and serving (a plain
+    # array with none). Dataset is small enough (~55 columns after
+    # one-hot encoding) that dense is a non-issue memory-wise.
+    ct = ColumnTransformer(
         transformers=[
             (
                 "cat",
-                OneHotEncoder(handle_unknown="ignore"),
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
                 CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL,
             ),
             ("num", StandardScaler(), NUMERIC_FEATURES + ENGINEERED_NUMERIC),
         ]
     )
+    return ct.set_output(transform="pandas")
 
 
 def build_pipeline(estimator) -> Pipeline:
@@ -130,6 +140,38 @@ def search_spaces() -> dict:
                 "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
                 "model__max_depth": [2, 3, 4],
                 "model__subsample": [0.7, 0.85, 1.0],
+            },
+        ),
+        "xgboost": (
+            XGBClassifier(
+                random_state=RANDOM_STATE,
+                n_jobs=1,
+                eval_metric="logloss",
+            ),
+            {
+                "model__n_estimators": [100, 200, 300],
+                "model__max_depth": [2, 3, 4, 5, 6],
+                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+                "model__subsample": [0.6, 0.8, 1.0],
+                "model__colsample_bytree": [0.6, 0.8, 1.0],
+                "model__min_child_weight": [1, 3, 5],
+            },
+        ),
+        "lightgbm": (
+            LGBMClassifier(
+                random_state=RANDOM_STATE,
+                n_jobs=1,
+                subsample_freq=1,
+                verbosity=-1,
+            ),
+            {
+                "model__n_estimators": [100, 200, 300],
+                "model__num_leaves": [15, 31, 63, 127],
+                "model__max_depth": [-1, 3, 5, 7],
+                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+                "model__subsample": [0.6, 0.8, 1.0],
+                "model__colsample_bytree": [0.6, 0.8, 1.0],
+                "model__min_child_samples": [5, 10, 20, 30],
             },
         ),
     }

@@ -65,8 +65,9 @@ requirements.txt
 ## Model
 
 `train/train.py` builds a pipeline of three steps — feature engineering,
-preprocessing, and a classifier — for each of three model families, and
-keeps whichever generalizes best. Concretely, per candidate:
+preprocessing, and a classifier — for each of five model families (Logistic
+Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM), and keeps
+whichever generalizes best. Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
    training and serving can never drift apart): adds `num_addon_services`
@@ -98,7 +99,21 @@ model's best hyperparameters and CV scores):
 |---|---|---|---|---|---|
 | Logistic Regression | 0.849 | 0.56 | 0.756 | 0.619 | 0.836 |
 | Random Forest | 0.849 | 0.48 | 0.738 | 0.617 | 0.836 |
-| **Gradient Boosting (selected)** | **0.850** | **0.28** | **0.743** | **0.620** | **0.839** |
+| Gradient Boosting | 0.850 | 0.28 | 0.743 | 0.620 | 0.839 |
+| XGBoost | 0.851 | 0.27 | 0.730 | 0.615 | 0.839 |
+| **LightGBM (selected)** | **0.851** | **0.29** | **0.744** | **0.623** | **0.841** |
+
+All five land within ~1 point of ROC-AUC and ~1 point of churn F1 of each
+other — this dataset's ceiling with these features has essentially been
+reached; XGBoost/LightGBM's edge over plain Gradient Boosting is real but
+small, not the order-of-magnitude jump they sometimes deliver on larger,
+messier tabular datasets. Squeezing out more from here would need new
+information (e.g. support-ticket or usage data), not further tuning.
+
+Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
+the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
+`Medium` always straddles the actual Yes/No decision boundary, so it stays
+coherent even though thresholds vary a lot between models (0.27–0.56).
 
 Hyperparameter tuning + feature engineering lifted CV ROC-AUC from ~0.834
 (untuned baseline) to ~0.849–0.850 across the board. All three tuned models
@@ -149,7 +164,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.6748,
+  "churn_probability": 0.6524,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }
