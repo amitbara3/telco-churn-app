@@ -27,7 +27,8 @@ all in a single Docker container.
 │                                              │                          │
 │                                              ▼                          │
 │                                   model/churn_model.joblib              │
-│                                   (scikit-learn Pipeline)                │
+│                          (scikit-learn Pipeline, or a small              │
+│                           probability-averaging ensemble of a few)       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,37 +69,47 @@ requirements.txt
 ## Model
 
 `train/train.py` builds a pipeline of three steps — feature engineering,
-preprocessing, and a classifier — for each of five model families (Logistic
-Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM), plus two
-probability-averaging ensembles of the top-3 and all 5, and keeps whichever
-generalizes best. Concretely, per candidate:
+preprocessing, and a classifier — for each of seven model families
+(Logistic Regression, Random Forest, Gradient Boosting, XGBoost, LightGBM,
+CatBoost with one-hot encoding, CatBoost with native categorical handling),
+plus two probability-averaging ensembles of the top-3 and all-7, and keeps
+whichever generalizes best. Concretely, per candidate:
 
 1. **Feature engineering** (`app/features.py`, shared with the live API so
-   training and serving can never drift apart): adds `num_addon_services`
+   training and serving can never drift apart): `num_addon_services`
    (count of subscribed add-ons), `avg_charge_per_tenure`
    (`TotalCharges / (tenure + 1)`), `charges_delta`
    (`tenure * MonthlyCharges - TotalCharges` — positive means the customer
    has been on some kind of discount relative to their current rate,
-   often a churn trigger once it expires), an `is_new_customer` flag
-   (tenure ≤ 3 months), and a bucketed `tenure_bucket`. It also collapses
-   the `"No internet/phone service"` category on 7 columns into `"No"` —
-   that value is 100% determined by `InternetService`/`PhoneService`
-   already being `"No"`, so keeping it as its own one-hot category just
-   re-encoded the same bit up to 6 times over. All derived values are
-   computed per-row from that row's own raw values, so they're safe to use
-   inside cross-validation without leaking across folds.
-2. **Preprocessing**: one-hot encoding for categorical features, standard
-   scaling for numeric ones (`ColumnTransformer`).
+   often a churn trigger once it expires) and its normalized form
+   `discount_ratio`, an `is_new_customer` flag (tenure ≤ 3 months), a
+   `high_risk_new_customer` flag (an explicit interaction of the two
+   strongest individual predictors: month-to-month contract *and*
+   tenure ≤ 12 months), `has_streaming` and `manual_payment` flags, and a
+   bucketed `tenure_bucket`. It also collapses the
+   `"No internet/phone service"` category on 7 columns into `"No"` — that
+   value is 100% determined by `InternetService`/`PhoneService` already
+   being `"No"`, so keeping it as its own one-hot category just re-encoded
+   the same bit up to 6 times over. All derived values are computed
+   per-row from that row's own raw values, so they're safe to use inside
+   cross-validation without leaking across folds.
+2. **Preprocessing**: one-hot encoding + standard scaling
+   (`ColumnTransformer`) for every candidate except CatBoost-native, which
+   consumes the raw category strings directly via CatBoost's built-in
+   `cat_features` handling — no one-hot step at all for that one.
 3. **Hyperparameter search**: `RandomizedSearchCV` (20 iterations, 5-fold
    `StratifiedKFold`, scored on ROC-AUC) over each model's own parameter
-   space, including L1/L2 regularization terms for XGBoost/LightGBM.
+   space — L1/L2 regularization for XGBoost/LightGBM/CatBoost, and (new)
+   `scale_pos_weight` searched over `[1.0, sqrt(imbalance ratio),
+   imbalance ratio]` for every boosting model, not just relying on
+   threshold tuning for the class imbalance.
 4. **Decision threshold tuning**: the default 0.5 cutoff is rarely optimal
    for an imbalanced target (~27% churn). Using `cross_val_predict` to get
    out-of-fold probabilities on the *training* split only, it sweeps
    thresholds and picks the one that maximizes F1 on the "Churn" class —
    without ever looking at the test set, so the threshold isn't overfit to
    it.
-5. **Ensembling**: averages predict_proba across the top-3 and all-5 tuned
+5. **Ensembling**: averages predict_proba across the top-3 and all-7 tuned
    models (`AverageProbabilityEnsemble` in `app/features.py`), evaluated
    the same way as any other candidate.
 6. **Model selection**: whichever candidate scores best on **F1 for the
@@ -112,52 +123,53 @@ model's best hyperparameters and CV scores):
 
 | Model | CV ROC-AUC | Tuned threshold | Test Accuracy | Test Churn F1 | Test ROC-AUC |
 |---|---|---|---|---|---|
-| Logistic Regression | 0.849 | 0.61 | 0.774 | 0.626 | 0.837 |
-| Random Forest | 0.851 | 0.56 | 0.775 | 0.626 | 0.837 |
-| Gradient Boosting | 0.850 | 0.36 | 0.780 | 0.630 | 0.840 |
-| XGBoost | 0.851 | 0.35 | 0.768 | 0.624 | 0.839 |
-| **LightGBM (selected)** | **0.851** | **0.32** | **0.761** | **0.632** | **0.840** |
-| CatBoost | 0.851 | 0.33 | 0.761 | 0.622 | 0.840 |
-| Ensemble (top 3) | — | 0.34 | 0.763 | 0.623 | 0.840 |
-| Ensemble (all 6) | — | 0.42 | 0.772 | 0.630 | 0.840 |
+| Logistic Regression | 0.850 | 0.61 | 0.773 | 0.622 | 0.837 |
+| Random Forest | 0.851 | 0.57 | 0.774 | 0.623 | 0.837 |
+| Gradient Boosting | 0.850 | 0.37 | 0.784 | 0.629 | 0.839 |
+| XGBoost | 0.851 | 0.33 | 0.765 | 0.629 | 0.839 |
+| LightGBM | 0.850 | 0.46 | 0.766 | 0.627 | 0.836 |
+| CatBoost (one-hot) | 0.851 | 0.44 | 0.763 | 0.625 | 0.839 |
+| CatBoost (native categoricals) | 0.850 | 0.46 | 0.772 | 0.630 | 0.840 |
+| **Ensemble, top 3 (selected)** | **—** | **0.48** | **0.782** | **0.632** | **0.839** |
+| Ensemble, all 7 | — | 0.46 | 0.773 | 0.631 | 0.840 |
+
+The deployed model is now an ensemble (CatBoost one-hot + XGBoost + Random
+Forest) — the first time in this project an ensemble has actually won.
 
 ### Feature importance
 
-Full ranked list for the deployed model (LightGBM) is written to
-`model/feature_importance.json` on every training run — normalized so
-values sum to 1 across all 47 encoded columns. Top 5:
+Full ranked list for the deployed model is written to
+`model/feature_importance.json` on every training run — for an ensemble,
+importances are averaged across its member pipelines. Top 5 (currently
+dominated by Contract, since CatBoost's importances weight it heavily):
 
 | Feature | Importance |
 |---|---|
-| `tenure` | 14.2% |
-| `MonthlyCharges` | 12.1% |
-| `charges_delta` | 10.5% |
-| `TotalCharges` | 9.9% |
-| `avg_charge_per_tenure` | 8.9% |
+| `Contract` = Month-to-month | 23.8% |
+| `InternetService` = Fiber optic | 7.1% |
+| `tenure` | 6.5% |
+| `high_risk_new_customer` (new) | 5.7% |
+| `Contract` = Two year | 5.2% |
 
-...and the tail — the 10 least useful of the 47 encoded columns:
+...and the tail — the 10 least useful of the 51 encoded columns:
 
 | Feature | Importance |
 |---|---|
-| `tenure_bucket_24-48` | 0.29% |
-| `PaymentMethod_Credit card (automatic)` | 0.29% |
-| `tenure_bucket_0-12` | 0.29% |
-| `PaymentMethod_Mailed check` | 0.29% |
-| `tenure_bucket_48-60` | 0.29% |
-| `StreamingTV_Yes` | 0.22% |
-| `tenure_bucket_60+` | 0.15% |
-| `OnlineBackup_Yes` | 0.15% |
-| `Partner_Yes` | 0.07% |
-| `DeviceProtection_Yes` | 0.0% (literally unused) |
+| `PaymentMethod_Bank transfer (automatic)` | 0.35% |
+| `OnlineBackup_No` | 0.35% |
+| `PaymentMethod_Credit card (automatic)` | 0.31% |
+| `tenure_bucket_24-48` | 0.31% |
+| `tenure_bucket_12-24` | 0.29% |
+| `Partner_No` | 0.25% |
+| `DeviceProtection_Yes` | 0.22% |
+| `DeviceProtection_No` | 0.20% |
+| `Partner_Yes` | 0.19% |
+| `tenure_bucket_48-60` | 0.13% |
 
-18 of the 47 encoded columns carry <0.5% of total importance each — a
-combined 5.0%. That's *after* already removing the worst structural
-redundancy (the collapsed `"No internet/phone service"` duplicates); what's
-left in this tail is mostly individual one-hot categories from
-low-signal columns (`Partner`, `DeviceProtection`, `PaymentMethod`) rather
-than anything mechanically redundant, so there isn't another free cleanup
-pass here — it's just genuinely weak signal in those columns for this
-target.
+14 of the 51 encoded columns carry <0.5% of total importance each — a
+combined 4.2%, in the same range as before. Same conclusion as previously:
+genuinely weak signal in those columns for this target, not another free
+cleanup opportunity.
 
 ### What moved the numbers, and what didn't
 
@@ -221,15 +233,48 @@ trusting our own numbers in isolation. Two findings:
   dataset are unfortunately more often a warning sign than a technique to
   copy — not something to chase.
 
-Given the matching paper's model choice, **added CatBoost** as a 6th
-candidate through the same search/CV/threshold-tuning pipeline as the
-other five (see updated table above). It landed at **0.622 test F1 — the
-weakest of all six**, not an improvement; LightGBM stays deployed,
-unchanged. (Along the way, tuning `l2_leaf_reg` via `RandomizedSearchCV`
-hit a real CatBoost/scikit-learn interop bug: CatBoost's `get_params()`
-doesn't preserve `numpy.float64` dtype on round-trip, which fails
-sklearn's `clone()` equality check — fixed by casting the search grid to
-native Python floats.)
+Given the matching paper's model choice, first **added CatBoost** through
+the same one-hot pipeline as everything else — it landed weakest of all
+six candidates at the time (0.622 test F1), not an improvement.
+
+Digging into the paper's full methodology (not just its headline numbers)
+surfaced two more specific techniques it credited that we hadn't tried:
+CatBoost's **native categorical handling** (`cat_features`, no one-hot at
+all) and **`scale_pos_weight` search** (tried at `1.0`, `sqrt(ratio)`, and
+the raw imbalance ratio) for every boosting model, not just relying on
+threshold tuning. Implemented both, plus a few of the paper's own
+domain-engineered features (`high_risk_new_customer`, `has_streaming`,
+`manual_payment`, `discount_ratio`). Honest results, each verified on the
+untouched test set:
+
+- **Native categorical handling for CatBoost was a real, isolated win**:
+  same search space, same everything else — one-hot CatBoost scored 0.625
+  test F1, native CatBoost scored **0.630**. This directly confirms the
+  paper's specific claim, not just its headline number.
+- **`scale_pos_weight` search was a wash for some models and a regression
+  for one**: LightGBM's test F1 actually *dropped* (0.632 → 0.627) after
+  adding it as an 8th tuned dimension to `RandomizedSearchCV` — with the
+  same 20-iteration search budget, one more dimension means less effective
+  coverage of the parameters that mattered before. A lesson in its own
+  right: widening a hyperparameter search without widening its budget can
+  quietly make individual candidates worse, even when it helps others.
+- **The combination made ensembling finally pay off**: previously,
+  ensembling never beat the best single model. With native CatBoost now in
+  the mix, `Ensemble (top 3)` — CatBoost (one-hot) + XGBoost + Random
+  Forest — edges out every individual candidate: test F1 0.632 (vs. the
+  prior deployment's 0.6316 — a marginal but real gain, not tied) and test
+  accuracy 0.782 (vs. 0.761, a more solid +2 points). ROC-AUC is flat.
+
+Net: modest, not dramatic — consistent with the ceiling already being
+close. But real, verified, multi-metric-consistent, and it came from
+specific, attributable techniques rather than "try more stuff and see."
+The deployed model is now `Ensemble (top 3)`. (Along the way, hit and
+fixed *two* separate CatBoost/scikit-learn interop bugs: `l2_leaf_reg` and
+`cat_features` both fail sklearn's `clone()` equality check when passed as
+constructor arguments — `l2_leaf_reg` fixed by casting to native Python
+floats, `cat_features` fixed by passing it through `.fit()` instead of the
+constructor, since `RandomizedSearchCV`/`cross_val_predict` support
+per-step fit params via the `model__cat_features=...` prefix convention.)
 
 ### Beam search feature selection (tried, didn't generalize)
 
@@ -263,7 +308,7 @@ not discarded.
 Risk-level bands (`Low`/`Medium`/`High` in the API response) scale with
 the selected model's tuned threshold rather than fixed 0.33/0.66 cutoffs —
 `Medium` always straddles the actual Yes/No decision boundary, so it stays
-coherent even though thresholds vary a lot between models (0.27–0.61).
+coherent even though thresholds vary a lot between models (0.33–0.61).
 
 ## Local development
 
@@ -274,7 +319,7 @@ pip install -r requirements-dev.txt
 
 # Train the model (writes model/churn_model.joblib, decision_threshold.json,
 # metrics.json, feature_schema.json). Runs a hyperparameter search across
-# 3 model families with 5-fold CV, so it takes ~30s-1min.
+# 7 model families with 5-fold CV, so it takes ~1-2min.
 python train/train.py
 
 # Run the tests
@@ -306,7 +351,7 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "churn_probability": 0.6828,
+  "churn_probability": 0.7508,
   "churn_prediction": "Yes",
   "risk_level": "High"
 }

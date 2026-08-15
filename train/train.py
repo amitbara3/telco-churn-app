@@ -78,6 +78,10 @@ CATEGORICAL_FEATURES = [
 NUMERIC_FEATURES = ["SeniorCitizen", "tenure", "MonthlyCharges", "TotalCharges"]
 TARGET = "Churn"
 
+# For CatBoost's native categorical handling (no one-hot encoding at all —
+# it consumes raw category strings directly).
+NATIVE_CATEGORICAL_COLUMNS = CATEGORICAL_FEATURES + ENGINEERED_CATEGORICAL
+
 RANDOM_STATE = 42
 CV_FOLDS = 5
 SEARCH_ITER = 20
@@ -125,7 +129,14 @@ def build_pipeline(estimator) -> Pipeline:
     )
 
 
-def search_spaces() -> dict:
+def build_native_categorical_pipeline(estimator) -> Pipeline:
+    """No ColumnTransformer/one-hot step at all — the estimator (CatBoost,
+    with cat_features set) consumes FeatureEngineer's raw+engineered
+    DataFrame directly."""
+    return Pipeline(steps=[("engineer", FeatureEngineer()), ("model", estimator)])
+
+
+def search_spaces(scale_pos_weight_options: list[float]) -> dict:
     return {
         "logistic_regression": (
             LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE),
@@ -169,6 +180,13 @@ def search_spaces() -> dict:
                 "model__reg_alpha": np.logspace(-3, 1, 10),
                 "model__reg_lambda": np.logspace(-3, 1, 10),
                 "model__gamma": [0, 0.1, 0.5, 1, 2],
+                # Class-weighting via scale_pos_weight, searched over 1.0
+                # (off), sqrt(imbalance ratio), and the raw ratio — mirrors
+                # what arXiv:2607.10260 did on this same dataset. Until now
+                # we only relied on threshold tuning for imbalance on the
+                # boosting models; this gives the search the option to
+                # weight the loss itself too.
+                "model__scale_pos_weight": scale_pos_weight_options,
             },
         ),
         "lightgbm": (
@@ -188,6 +206,7 @@ def search_spaces() -> dict:
                 "model__min_child_samples": [5, 10, 20, 30],
                 "model__reg_alpha": np.logspace(-3, 1, 10),
                 "model__reg_lambda": np.logspace(-3, 1, 10),
+                "model__scale_pos_weight": scale_pos_weight_options,
             },
         ),
         "catboost": (
@@ -206,15 +225,37 @@ def search_spaces() -> dict:
                 # (RandomizedSearchCV clones the pipeline per fold/candidate).
                 "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
                 "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
+                "model__scale_pos_weight": scale_pos_weight_options,
+            },
+        ),
+        "catboost_native": (
+            # Same search space as "catboost" above, but fed raw category
+            # strings via cat_features instead of one-hot columns — the
+            # independent benchmark specifically credited this (plus
+            # ordered boosting) for CatBoost's result, so it's worth
+            # isolating from the one-hot version to see what it actually
+            # buys on its own.
+            #
+            # cat_features is passed at fit() time (see NATIVE_FIT_PARAMS),
+            # not the constructor: passing it as a constructor arg hits a
+            # real CatBoost/sklearn interop bug — CatBoost's get_params()
+            # doesn't round-trip a cat_features list in a way that
+            # satisfies sklearn's clone() equality check (the same class of
+            # issue as the l2_leaf_reg numpy-dtype bug above, different
+            # parameter). Passing it via fit() sidesteps clone() entirely.
+            CatBoostClassifier(random_state=RANDOM_STATE, verbose=False, thread_count=1),
+            {
+                "model__iterations": [100, 200, 300],
+                "model__depth": [3, 4, 5, 6, 7],
+                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+                "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
+                "model__scale_pos_weight": scale_pos_weight_options,
             },
         ),
     }
 
 
-ENSEMBLE_COMBOS = {
-    "ensemble_top3": 3,
-    "ensemble_all": len(search_spaces()),
-}
+NATIVE_FIT_PARAMS = {"model__cat_features": NATIVE_CATEGORICAL_COLUMNS}
 
 
 def best_threshold_for_f1(y_true, y_proba) -> tuple[float, float]:
@@ -235,7 +276,15 @@ def extract_feature_importance(pipeline) -> pd.Series | None:
 
     def single(p: Pipeline) -> pd.Series | None:
         model = p.named_steps["model"]
-        names = p.named_steps["preprocess"].get_feature_names_out()
+        if "preprocess" in p.named_steps:
+            names = p.named_steps["preprocess"].get_feature_names_out()
+        elif hasattr(model, "feature_names_"):
+            # No ColumnTransformer step (e.g. CatBoost with native
+            # categoricals) — the model itself remembers the raw column
+            # names it was fit on.
+            names = model.feature_names_
+        else:
+            return None
         if hasattr(model, "feature_importances_"):
             values = np.asarray(model.feature_importances_, dtype=float)
         elif hasattr(model, "coef_"):
@@ -285,12 +334,22 @@ def main() -> None:
 
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
+    ratio = float((y_train == 0).sum() / (y_train == 1).sum())
+    scale_pos_weight_options = [1.0, float(np.sqrt(ratio)), ratio]
+    print(f"Class imbalance ratio (neg/pos) on train: {ratio:.3f}  "
+          f"scale_pos_weight options: {[round(v, 3) for v in scale_pos_weight_options]}")
+
+    candidates = search_spaces(scale_pos_weight_options)
+    ensemble_combos = {"ensemble_top3": 3, "ensemble_all": len(candidates)}
+
     results = {}
     fitted = {}  # name -> {pipeline, oof_proba, test_proba, cv_roc_auc_mean}
     candidate_pipelines = {}  # name -> object with .predict_proba(X), for saving
 
-    for name, (estimator, param_dist) in search_spaces().items():
-        pipeline = build_pipeline(estimator)
+    for name, (estimator, param_dist) in candidates.items():
+        is_native = name == "catboost_native"
+        pipeline = build_native_categorical_pipeline(estimator) if is_native else build_pipeline(estimator)
+        fit_params = NATIVE_FIT_PARAMS if is_native else {}
 
         search = RandomizedSearchCV(
             pipeline,
@@ -302,7 +361,7 @@ def main() -> None:
             n_jobs=-1,
             refit=True,
         )
-        search.fit(X_train, y_train)
+        search.fit(X_train, y_train, **fit_params)
         tuned_pipeline = search.best_estimator_
         cv_std = float(search.cv_results_["std_test_score"][search.best_index_])
 
@@ -310,7 +369,8 @@ def main() -> None:
         # tuned hyperparameters, so the threshold is picked without ever
         # touching the held-out test set.
         oof_proba = cross_val_predict(
-            tuned_pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1
+            tuned_pipeline, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1,
+            params=fit_params,
         )[:, 1]
         threshold, oof_f1 = best_threshold_for_f1(y_train, oof_proba)
 
@@ -345,7 +405,7 @@ def main() -> None:
     # similar performance, by cancelling out some of each model's
     # uncorrelated errors.
     ranked = sorted(fitted, key=lambda n: fitted[n]["cv_roc_auc_mean"], reverse=True)
-    for ensemble_name, k in ENSEMBLE_COMBOS.items():
+    for ensemble_name, k in ensemble_combos.items():
         members = ranked[:k]
         oof_avg = np.mean([fitted[m]["oof_proba"] for m in members], axis=0)
         threshold, oof_f1 = best_threshold_for_f1(y_train, oof_avg)

@@ -43,6 +43,13 @@ TENURE_BUCKET_EDGES = [-1, 12, 24, 48, 60, 1000]
 TENURE_BUCKET_LABELS = ["0-12", "12-24", "24-48", "48-60", "60+"]
 
 NEW_CUSTOMER_TENURE_MONTHS = 3
+HIGH_RISK_TENURE_MONTHS = 12
+
+# PaymentMethod values that require the customer to actively take an
+# action each cycle, vs. being billed automatically — a commonly-cited
+# churn signal in telecom (an independent benchmark on this same dataset,
+# arXiv:2607.10260, engineered an equivalent "payment stability" feature).
+MANUAL_PAYMENT_METHODS = {"Electronic check", "Mailed check"}
 
 ENGINEERED_CATEGORICAL = ["tenure_bucket"]
 ENGINEERED_NUMERIC = [
@@ -50,6 +57,10 @@ ENGINEERED_NUMERIC = [
     "avg_charge_per_tenure",
     "charges_delta",
     "is_new_customer",
+    "discount_ratio",
+    "has_streaming",
+    "high_risk_new_customer",
+    "manual_payment",
 ]
 
 
@@ -70,7 +81,22 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         # i.e. they've been on a discount/promo at some point in their
         # tenure. A common telecom churn trigger is that discount expiring.
         X["charges_delta"] = X["tenure"] * X["MonthlyCharges"] - X["TotalCharges"]
+        # Same signal as charges_delta, normalized to a fraction of expected
+        # spend rather than an absolute dollar amount — trees may split on
+        # the ratio differently than on the raw delta.
+        X["discount_ratio"] = X["charges_delta"] / (X["tenure"] * X["MonthlyCharges"] + 1)
         X["is_new_customer"] = (X["tenure"] <= NEW_CUSTOMER_TENURE_MONTHS).astype(int)
+        X["has_streaming"] = (
+            (X["StreamingTV"] == "Yes") | (X["StreamingMovies"] == "Yes")
+        ).astype(int)
+        # Explicit interaction between the two strongest individual
+        # predictors (Contract, tenure) — trees can already learn this via
+        # splits, but giving it a dedicated column costs nothing and helps
+        # the linear candidate (Logistic Regression) capture it directly.
+        X["high_risk_new_customer"] = (
+            (X["Contract"] == "Month-to-month") & (X["tenure"] <= HIGH_RISK_TENURE_MONTHS)
+        ).astype(int)
+        X["manual_payment"] = X["PaymentMethod"].isin(MANUAL_PAYMENT_METHODS).astype(int)
         X["tenure_bucket"] = pd.cut(
             X["tenure"], bins=TENURE_BUCKET_EDGES, labels=TENURE_BUCKET_LABELS
         ).astype(str)
