@@ -9,3 +9,4 @@ streamlit==1.41.1
 requests==2.32.3
 xgboost==3.2.0
 lightgbm==4.6.0
+catboost==1.2.10

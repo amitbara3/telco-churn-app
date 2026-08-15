@@ -24,6 +24,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -189,12 +190,30 @@ def search_spaces() -> dict:
                 "model__reg_lambda": np.logspace(-3, 1, 10),
             },
         ),
+        "catboost": (
+            # A closely-matching independent benchmark on this exact
+            # dataset (same 5-fold CV + F1-threshold-tuning methodology)
+            # deployed CatBoost as its final model, so it's worth having
+            # in the comparison rather than assuming the four boosters
+            # already tried cover the space.
+            CatBoostClassifier(random_state=RANDOM_STATE, verbose=False, thread_count=1),
+            {
+                "model__iterations": [100, 200, 300],
+                "model__depth": [3, 4, 5, 6, 7],
+                # Native Python floats, not numpy.float64: CatBoost's
+                # get_params()/constructor round-trip doesn't preserve
+                # numpy scalar dtype, which fails sklearn's clone() check
+                # (RandomizedSearchCV clones the pipeline per fold/candidate).
+                "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
+                "model__l2_leaf_reg": [float(x) for x in np.logspace(-1, 2, 10)],
+            },
+        ),
     }
 
 
 ENSEMBLE_COMBOS = {
     "ensemble_top3": 3,
-    "ensemble_all5": 5,
+    "ensemble_all": len(search_spaces()),
 }
 
 

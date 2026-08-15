@@ -117,8 +117,9 @@ model's best hyperparameters and CV scores):
 | Gradient Boosting | 0.850 | 0.36 | 0.780 | 0.630 | 0.840 |
 | XGBoost | 0.851 | 0.35 | 0.768 | 0.624 | 0.839 |
 | **LightGBM (selected)** | **0.851** | **0.32** | **0.761** | **0.632** | **0.840** |
-| Ensemble (top 3) | — | 0.42 | 0.771 | 0.625 | 0.840 |
-| Ensemble (all 5) | — | 0.43 | 0.770 | 0.630 | 0.840 |
+| CatBoost | 0.851 | 0.33 | 0.761 | 0.622 | 0.840 |
+| Ensemble (top 3) | — | 0.34 | 0.763 | 0.623 | 0.840 |
+| Ensemble (all 6) | — | 0.42 | 0.772 | 0.630 | 0.840 |
 
 ### Feature importance
 
@@ -194,6 +195,41 @@ consistent across the board — and further confirmation that we're now
 close to what these 19 raw features can support. The next real gain would
 come from new data (support tickets, usage patterns, competitor pricing
 signals), not more modeling.
+
+### How this compares to published results (and adding CatBoost)
+
+Checked this against outside work on the same dataset rather than just
+trusting our own numbers in isolation. Two findings:
+
+- **A close, credible match**: an independent paper on this exact dataset
+  ([arXiv:2607.10260](https://arxiv.org/abs/2607.10260)) used almost the
+  same methodology we'd already converged on independently — stratified
+  5-fold CV, class weighting, F1-driven threshold tuning — and deployed
+  CatBoost as their final model, reporting **77.68% accuracy, F1 0.6366,
+  ROC-AUC 0.8403** on their held-out test set. That's within a point of our
+  own 76.1% / 0.632 / 0.840. Independent convergence on near-identical
+  numbers via near-identical methodology is good evidence this is the real
+  ceiling for this dataset, not an artifact of how we did it.
+- **The suspiciously high numbers elsewhere are a red flag, not a lead**:
+  several sources claim 90%+ accuracy or ROC-AUC >0.92 on this same
+  dataset. Checking one such paper's own methodology description turned up
+  an acknowledged ambiguity in *when* SMOTE oversampling was applied
+  relative to the train/test split and cross-validation folds — applying
+  SMOTE before splitting is a classic, common leakage bug on this exact
+  dataset (synthetic minority samples derived from what should be held-out
+  data leak into training). Public notebooks claiming huge scores on this
+  dataset are unfortunately more often a warning sign than a technique to
+  copy — not something to chase.
+
+Given the matching paper's model choice, **added CatBoost** as a 6th
+candidate through the same search/CV/threshold-tuning pipeline as the
+other five (see updated table above). It landed at **0.622 test F1 — the
+weakest of all six**, not an improvement; LightGBM stays deployed,
+unchanged. (Along the way, tuning `l2_leaf_reg` via `RandomizedSearchCV`
+hit a real CatBoost/scikit-learn interop bug: CatBoost's `get_params()`
+doesn't preserve `numpy.float64` dtype on round-trip, which fails
+sklearn's `clone()` equality check — fixed by casting the search grid to
+native Python floats.)
 
 ### Beam search feature selection (tried, didn't generalize)
 
